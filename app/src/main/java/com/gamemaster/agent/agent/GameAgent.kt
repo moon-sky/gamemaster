@@ -56,6 +56,9 @@ class GameAgent(
     /** 上一次"重复滑动"纠偏时的方向：连续两次水平纠偏说明需要强制改用垂直方向 */
     private var lastRepeatDir: String? = null
 
+    /** 弱模型无视"换垂直方向"指令时，下一次 swipe 直接由系统改写为向下滑动 */
+    private var forceVerticalNext = false
+
     /** 开工前的任务理解与分步计划（规划失败可为 null，退化为无计划执行） */
     @Volatile
     private var plan: TaskPlan? = null
@@ -821,10 +824,24 @@ class GameAgent(
                 // 在归一化坐标里规整：取主导轴为唯一方向、滑满至少 45% 屏宽/高、
                 // 起止点收进安全边距内，保证任何 App 都能识别为明确的方向手势。
                 val lo = 70f; val hi = 930f; val minLen = 450f
-                var sx = action.x.coerceIn(lo, hi)
-                var sy = action.y.coerceIn(lo, hi)
-                var ex = action.x2.coerceIn(lo, hi)
-                var ey = action.y2.coerceIn(lo, hi)
+                // 弱模型无视"必须换垂直方向"的文字纠偏、下一条仍是水平滑动时，
+                // 系统直接把这次手势改写为向下滑动，用真实的棋盘变化打破横跳死循环
+                val rawHorizontal = kotlin.math.abs(action.x2 - action.x) >=
+                    kotlin.math.abs(action.y2 - action.y)
+                val overridden = forceVerticalNext && rawHorizontal
+                if (forceVerticalNext) forceVerticalNext = false
+                val sx0 = if (overridden) 500f else action.x
+                val sy0 = if (overridden) 250f else action.y
+                val ex0 = if (overridden) 500f else action.x2
+                val ey0 = if (overridden) 800f else action.y2
+                if (overridden) {
+                    history.addLast("系统：你没有按要求换方向，系统已替你执行了一次向下滑动，棋盘已经变化。请重新观察棋盘，优先寻找同一列可以纵向合并的相同数字继续操作。")
+                    android.util.Log.i("GameMaster", "[anti-repeat] 模型仍水平滑动，系统强制执行向下滑动打破横跳")
+                }
+                var sx = sx0.coerceIn(lo, hi)
+                var sy = sy0.coerceIn(lo, hi)
+                var ex = ex0.coerceIn(lo, hi)
+                var ey = ey0.coerceIn(lo, hi)
                 val dx = ex - sx
                 val dy = ey - sy
                 if (kotlin.math.abs(dx) >= kotlin.math.abs(dy)) {
@@ -860,7 +877,8 @@ class GameAgent(
                     val hint = if (stuckHorizontal) {
                         "系统：你一直在左右横跳，水平滑动已经无法产生合并——这一步必须改用垂直方向（向上或向下）滑动，" +
                             "看看哪些相同数字在同一列（比如同一列上下相邻的两个相同方块），让它们纵向相撞；" +
-                            "接下来两步也优先做纵向合并，把大数字集中到同一列的角落。"
+                            "接下来两步也优先做纵向合并，把大数字集中到同一列的角落。" +
+                            "如果你下一条指令仍然是水平滑动，系统将直接忽略并替你执行一次向下滑动。"
                     } else {
                         "系统：你已连续 ${recentSwipeDirs.size} 次只向$dir 滑动，但棋盘没有产生合并——这个方向当前无效，属于机械重复。" +
                             "请仔细看清棋盘：找出同一行或同一列上相邻/只隔空格的相同数字，立即换一个能让它们相撞合并的方向（上/下/左/右中的另一个方向），" +
@@ -869,6 +887,7 @@ class GameAgent(
                     history.addLast(hint)
                     android.util.Log.i("GameMaster", "[anti-repeat] 检测到连续 ${recentSwipeDirs.size} 次$dir 滑，已注入换方向纠偏（强制垂直=$stuckHorizontal）")
                     lastRepeatDir = dir
+                    if (stuckHorizontal) forceVerticalNext = true
                     recentSwipeDirs.clear()
                 }
                 service.swipe(
