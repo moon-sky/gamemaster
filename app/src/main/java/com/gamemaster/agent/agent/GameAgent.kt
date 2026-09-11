@@ -19,6 +19,7 @@ class GameAgent(
     /** 繁忙/异常时的备用视觉模型（仅非思考模型，保证速度；思考模型思维链太长会吃光 token） */
     private val fallbackModels = ArrayDeque(
         listOf(
+            "glm-4v-flash",
             "glm-4.6v-flash"
         ).filter { it != config.model.trim() }
     )
@@ -51,6 +52,9 @@ class GameAgent(
 
     /** 最近连续相同方向的滑动序列：模型陷入机械重复（尤其弱模型）时强制纠偏 */
     private val recentSwipeDirs = ArrayDeque<String>()
+
+    /** 上一次"重复滑动"纠偏时的方向：连续两次水平纠偏说明需要强制改用垂直方向 */
+    private var lastRepeatDir: String? = null
 
     /** 开工前的任务理解与分步计划（规划失败可为 null，退化为无计划执行） */
     @Volatile
@@ -806,13 +810,23 @@ class GameAgent(
                 }
                 if (recentSwipeDirs.lastOrNull() != dir) recentSwipeDirs.clear()
                 recentSwipeDirs.addLast(dir)
+                if (dir == "上" || dir == "下") lastRepeatDir = null
                 if (recentSwipeDirs.size >= 4) {
-                    history.addLast(
+                    // 连续两次都在水平方向上卡死（左↔右横跳），这次直接强制垂直方向
+                    val stuckHorizontal = (dir == "左" || dir == "右") &&
+                        (lastRepeatDir == "左" || lastRepeatDir == "右")
+                    val hint = if (stuckHorizontal) {
+                        "系统：你一直在左右横跳，水平滑动已经无法产生合并——这一步必须改用垂直方向（向上或向下）滑动，" +
+                            "看看哪些相同数字在同一列（比如同一列上下相邻的两个相同方块），让它们纵向相撞；" +
+                            "接下来两步也优先做纵向合并，把大数字集中到同一列的角落。"
+                    } else {
                         "系统：你已连续 ${recentSwipeDirs.size} 次只向$dir 滑动，但棋盘没有产生合并——这个方向当前无效，属于机械重复。" +
                             "请仔细看清棋盘：找出同一行或同一列上相邻/只隔空格的相同数字，立即换一个能让它们相撞合并的方向（上/下/左/右中的另一个方向），" +
                             "并在后续几步持续围绕大数字所在的角落布局；不要再重复向$dir 滑动。"
-                    )
-                    android.util.Log.i("GameMaster", "[anti-repeat] 检测到连续 ${recentSwipeDirs.size} 次$dir 滑，已注入换方向纠偏")
+                    }
+                    history.addLast(hint)
+                    android.util.Log.i("GameMaster", "[anti-repeat] 检测到连续 ${recentSwipeDirs.size} 次$dir 滑，已注入换方向纠偏（强制垂直=$stuckHorizontal）")
+                    lastRepeatDir = dir
                     recentSwipeDirs.clear()
                 }
                 service.swipe(
