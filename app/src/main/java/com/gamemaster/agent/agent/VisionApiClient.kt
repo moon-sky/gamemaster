@@ -170,6 +170,76 @@ class VisionApiClient(
     }
 
     /**
+     * 最后一步的"目标证据"系统复核：用一次极简视觉调用判断最终可见标志是否已出现。
+     * 用于弱模型自己看不出 128 方块、迟迟不 finish 的兜底；任何异常都按"未确认"处理。
+     */
+    fun verifyGoalEvidence(imageBase64: String, evidence: String): Boolean {
+        if (imageBase64.isBlank()) return false
+        return try {
+            val messages = JSONArray()
+            messages.put(
+                JSONObject()
+                    .put("role", "system")
+                    .put("content", "你是严格的屏幕目标核验器，只根据截图判断，绝不猜测。只允许回答 YES 或 NO，不要输出任何其他内容。")
+            )
+            val content = JSONArray()
+            content.put(
+                JSONObject().put("type", "text").put(
+                    "text",
+                    "请判断下面这个“任务完成的可见标志”此刻是否已经真实、完整地出现在屏幕画面中：$evidence\n" +
+                        "要求：必须在真正的内容区域里看到（例如游戏棋盘内的数字方块），应用标题、按钮文字、装饰性图案不算。" +
+                        "确实已经出现才回答 YES，否则回答 NO。"
+                )
+            )
+            content.put(
+                JSONObject().put("type", "image_url").put(
+                    "image_url",
+                    JSONObject().put("url", "data:image/jpeg;base64,$imageBase64")
+                )
+            )
+            messages.put(JSONObject().put("role", "user").put("content", content))
+
+            val payload = JSONObject()
+                .put("model", model)
+                .put("messages", messages)
+                .put("temperature", 0)
+                .put("max_tokens", 20)
+
+            val endpoint = "${baseUrl.trimEnd('/')}/chat/completions"
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 20_000
+                readTimeout = 40_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Authorization", "Bearer $apiKey")
+            }
+            try {
+                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val body = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+                if (code !in 200..299) {
+                    Log.w("GameMaster", "[verify] HTTP $code：${body.take(150)}")
+                    return false
+                }
+                val resp = JSONObject(body)
+                var text = resp.optJSONArray("choices")?.optJSONObject(0)
+                    ?.optJSONObject("message")?.optString("content", "").orEmpty()
+                text = text.replace(Regex("(?s)<think>.*"), "").trim()
+                Log.i("GameMaster", "[verify] 证据「${evidence.take(30)}」核验回复=${text.take(40)}")
+                val t = text.uppercase()
+                t.contains("YES") || (text.contains("是") && !text.contains("否") && text.length <= 10)
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.w("GameMaster", "[verify] 目标证据核验异常（按未确认处理）：${e.message?.take(100)}")
+            false
+        }
+    }
+
+    /**
      * 规划阶段（纯文本、不带截图）：让大模型先理解任务、选定 App、拆解成 5~8 个有序步骤。
      * 解析失败返回 null，调用方退化为无计划直接执行。
      */

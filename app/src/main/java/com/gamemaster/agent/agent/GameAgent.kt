@@ -59,6 +59,9 @@ class GameAgent(
     /** 弱模型无视"换垂直方向"指令时，下一次 swipe 直接由系统改写为向下滑动 */
     private var forceVerticalNext = false
 
+    /** 已处于计划最后一步的轮数（用于节流系统级目标证据复核） */
+    private var lastStepRounds = 0
+
     /** 开工前的任务理解与分步计划（规划失败可为 null，退化为无计划执行） */
     @Volatile
     private var plan: TaskPlan? = null
@@ -191,6 +194,15 @@ class GameAgent(
     private fun missingConstraints(p: TaskPlan, constraints: List<String>): List<String> {
         val text = p.goal + " " + p.steps.joinToString(" ")
         return constraints.filterNot { text.contains(it) }
+    }
+
+    /** 取最后一步括号里的"屏幕验证标志"作为系统复核证据；没有括号则用整步描述 */
+    private fun lastStepEvidence(p: TaskPlan): String? {
+        val last = p.steps.lastOrNull()?.trim().orEmpty()
+        if (last.isBlank()) return null
+        val marker = Regex("[（(]([^（）()]+)[）)]").findAll(last)
+            .map { it.groupValues[1] }.lastOrNull()?.trim()
+        return marker?.takeIf { it.length >= 2 } ?: last
     }
 
     /**
@@ -367,6 +379,26 @@ class GameAgent(
             // App 跑偏检测：当前前台既不是目标 App、也不是系统弹窗/本助手时进行纠偏；
             // 返回 true 表示本轮已直接拉回目标 App，跳过本轮决策
             if (driftGuard()) continue
+
+            // 最后一步的系统级证据复核：弱模型可能已经达成目标却不输出 finish（如 128
+            // 已经合出来还在继续滑动），每 3 轮用一次独立视觉调用代裁
+            if (p != null && !p.humanHandover && currentStep >= p.steps.size) {
+                lastStepRounds++
+                val evidence = lastStepEvidence(p)
+                if (evidence != null && image != null && lastStepRounds % 3 == 0) {
+                    service.postStatus("正在复核最终目标是否达成…")
+                    val hit = client.verifyGoalEvidence(image.base64, evidence)
+                    if (hit) {
+                        history.addLast("系统：视觉复核已确认屏幕上出现最终目标证据（$evidence），任务完成，结束执行。")
+                        android.util.Log.i("GameMaster", "[verify] 最终证据确认（$evidence），系统代裁 finish")
+                        service.setState(
+                            com.gamemaster.agent.service.AgentState.FINISHED,
+                            "目标已达成：$evidence"
+                        )
+                        break
+                    }
+                }
+            }
 
             // 4. 调用大模型（连续重复同一动作时附加破环警告）
             val loopNote = if (repeatCount >= 3) {
