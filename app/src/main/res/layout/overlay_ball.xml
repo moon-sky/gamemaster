@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="52dp"
+    android:layout_height="52dp"
+    android:background="@drawable/bg_ball"
+    android:gravity="center"
+    android:includeFontPadding="false"
+    android:scaleX="1"
+    android:scaleY="1"
+    android:text="@string/overlay_ball"
+    android:textColor="@color/white"
+    android:textSize="20sp"
+    android:textStyle="bold" />

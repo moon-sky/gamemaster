@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">游戏助手</string>
+    <string name="accessibility_service_label">游戏助手（AI自动操作）</string>
+    <string name="accessibility_desc">游戏助手通过该服务截取当前屏幕画面、理解游戏内容，并模拟点击、滑动、长按等手势，自动完成你下达的游戏任务。截图仅会发送到你自己配置的 AI 视觉接口，不会上传到任何其他服务器。</string>
+
+    <string name="title">游戏助手 · AI 自动操作</string>
+    <string name="section_perm">第一步：开启权限</string>
+    <string name="section_config">第二步：配置 AI 视觉接口</string>
+    <string name="section_task">第三步：告诉它要做什么</string>
+
+    <string name="btn_accessibility">开启无障碍服务</string>
+    <string name="btn_overlay">开启悬浮窗权限</string>
+    <string name="btn_projection">开启屏幕录制授权（Android 10 截屏用）</string>
+    <string name="btn_save">保存配置</string>
+    <string name="btn_start">开始任务</string>
+
+    <string name="hint_base_url">API 地址（OpenAI 兼容接口，如 https://dashscope.aliyuncs.com/compatible-mode/v1）</string>
+    <string name="hint_api_key">API Key</string>
+    <string name="hint_model">视觉模型名称（如 qwen-vl-max-latest、gpt-4o）</string>
+    <string name="hint_task">任务目标，例如：帮我完成游戏的每日签到并领取所有奖励</string>
+
+    <string name="tips">使用方法：\n1. 开启无障碍服务和悬浮窗权限；\n2. 填写可用的视觉大模型 API 地址、Key 和模型名；\n3. 用一句话写下任务目标，点“开始任务”，AI 立即开始；也可以显示悬浮球后随时切到游戏点“开始”。\n4. AI 会像人一样看屏幕、做决定、点按钮，随时可在悬浮面板点“停止”。\n注意：遇到登录、验证码、支付、充值等界面时 AI 会自动停止，不会擅自操作。</string>
+
+    <string name="overlay_channel">游戏助手悬浮窗</string>
+    <string name="overlay_running">游戏助手正在运行</string>
+    <string name="overlay_ball">助</string>
+    <string name="overlay_start">开始</string>
+    <string name="overlay_stop">停止</string>
+    <string name="overlay_collapse">收起</string>
+    <string name="overlay_exit">退出</string>
+    <string name="overlay_waiting">就绪。切到游戏后点“开始”。</string>
+    <string name="overlay_command_hint">告诉它要做什么，例如：打开小红书搜索宫保鸡丁的做法</string>
+    <string name="overlay_command_label">指令</string>
+</resources>
