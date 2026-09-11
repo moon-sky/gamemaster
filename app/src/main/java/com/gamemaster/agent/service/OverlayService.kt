@@ -88,6 +88,9 @@ class OverlayService : Service() {
     private fun showBall() {
         if (ballView != null) return
         val view = LayoutInflater.from(this).inflate(R.layout.overlay_ball, null)
+        // 悬浮球是本助手的工具，不是手机内容：整体从无障碍树隐藏，
+        // 避免 AI 把控件当成可点击目标操作
+        view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
 
         // 窗口尺寸固定为正方形像素：部分 ROM 对 WRAP_CONTENT 的悬浮窗测量异常，
         // 会把正圆背景拉成椭圆
@@ -157,6 +160,8 @@ class OverlayService : Service() {
     private fun showPanel() {
         if (panelView != null) return
         val view = LayoutInflater.from(this).inflate(R.layout.overlay_panel, null)
+        // 面板（含指令输入框）是本助手的工具：从无障碍树隐藏，杜绝 AI 给自己改任务
+        view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
 
         tvStatus = view.findViewById(R.id.tvOverlayStatus)
         tvState = view.findViewById(R.id.tvState)
@@ -173,7 +178,8 @@ class OverlayService : Service() {
                 return@setOnClickListener
             }
             if (acc.isAgentRunning()) {
-                // stopAgent 内部会把状态切换为"已停止"
+                // 运行中只允许停止；绝不保存输入框内容——
+                // 防止 AI 误点悬浮面板时把它编造的文字写进任务（任务只能由人在停止状态下改写）
                 acc.stopAgent()
             } else {
                 // 面板里输入了新指令：先保存为任务目标（与 App 内输入框等价）

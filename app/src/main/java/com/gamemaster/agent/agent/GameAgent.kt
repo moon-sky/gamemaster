@@ -49,6 +49,9 @@ class GameAgent(
     /** finish 复核被驳回次数：模型说完成但页面上找不到目标关键词/计划未走完，3 次后放行 */
     private var wrongFinishCount = 0
 
+    /** 最近连续相同方向的滑动序列：模型陷入机械重复（尤其弱模型）时强制纠偏 */
+    private val recentSwipeDirs = ArrayDeque<String>()
+
     /** 开工前的任务理解与分步计划（规划失败可为 null，退化为无计划执行） */
     @Volatile
     private var plan: TaskPlan? = null
@@ -155,27 +158,78 @@ class GameAgent(
             "只有本步的验证标志真实出现在屏幕上后，才允许把 plan_step 推进到下一步。"
     }
 
-    /** 开工前先规划：理解任务 → 选 App → 拆步骤；主模型失败时依次试备用模型，全失败则无计划执行 */
+    /**
+     * 从任务里提取用户的硬性约束：
+     *  - 数字（≥10，如 128、9-26 里的 9 不算）
+     *  - "不要/不加/忌/去掉 XX"这类忌口或排除项（如"不要可乐"→"可乐"）
+     */
+    private fun extractConstraints(task: String): List<String> {
+        val out = LinkedHashSet<String>()
+        Regex("\\d{2,}").findAll(task).forEach { out.add(it.value) }
+        Regex("""(?:不要|不用|不加|别要|别加|忌口?|去掉|不要放)\s*([一-龥A-Za-z0-9]{2,6})""")
+            .findAll(task).forEach { m ->
+                // 去掉句尾语气/标点字
+                out.add(m.groupValues[1].trimEnd('的', '了', '，', '。', '、', ' '))
+            }
+        return out.toList().filter { it.isNotBlank() }
+    }
+
+    /** 计划文本里缺失的约束数 */
+    private fun missingConstraints(p: TaskPlan, constraints: List<String>): List<String> {
+        val text = p.goal + " " + p.steps.joinToString(" ")
+        return constraints.filterNot { text.contains(it) }
+    }
+
+    /** 开工前先规划：理解任务 → 选 App → 拆步骤。
+     *  规划质量不达标（丢了用户硬约束）时带纠错提示重规划，必要时换备用模型；全失败则无计划执行 */
     private suspend fun makePlan() {
         service.postStatus("正在理解任务并拆解执行步骤…")
-        val models = ArrayDeque<String>().apply {
-            add(currentModelName)
-            addAll(fallbackModels)
+        val constraints = extractConstraints(config.task)
+        val repairHint = if (constraints.isEmpty()) "" else
+            "上一版计划丢失了用户明确提出的硬性约束：${constraints.joinToString("、")}。" +
+                "请重新拆解，goal 必须复述这些约束，并且必须有专门的步骤去达成并在屏幕上核对它们。"
+
+        // 候选顺序：主模型首规划 → 主模型带纠错重试 → 备用模型带纠错重试
+        data class Candidate(val model: String, val hint: String)
+        val candidates = mutableListOf(Candidate(currentModelName, ""))
+        if (repairHint.isNotBlank()) {
+            candidates.add(Candidate(currentModelName, repairHint))
+            fallbackModels.forEach { candidates.add(Candidate(it, repairHint)) }
+        } else {
+            fallbackModels.forEach { candidates.add(Candidate(it, "")) }
         }
-        for (model in models) {
+
+        var best: TaskPlan? = null
+        var bestMissing = Int.MAX_VALUE
+        for (c in candidates) {
             try {
-                val p = VisionApiClient(config.baseUrl, config.apiKey, model).planTask(config.task)
+                val p = VisionApiClient(config.baseUrl, config.apiKey, c.model).planTask(config.task, c.hint)
                 if (p != null) {
-                    plan = p
-                    currentStep = 1
-                    service.postStatus("任务已拆解为 ${p.steps.size} 步：${p.goal}")
-                    android.util.Log.i("GameMaster", "[plan] 规划完成（$model）：${p.steps.size} 步，目标 App=${p.targetApp}")
-                    delay(600)
-                    return
+                    val missing = missingConstraints(p, constraints)
+                    android.util.Log.i(
+                        "GameMaster",
+                        "[plan] 模型 ${c.model} 给出 ${p.steps.size} 步，约束命中=${constraints.size - missing.size}/${constraints.size}，缺失=${missing.joinToString("、")}"
+                    )
+                    if (missing.size < bestMissing) { best = p; bestMissing = missing.size }
+                    if (missing.isEmpty()) break
                 }
             } catch (e: Exception) {
-                android.util.Log.w("GameMaster", "[plan] 模型 $model 规划失败：${e.message?.take(120)}")
+                android.util.Log.w("GameMaster", "[plan] 模型 ${c.model} 规划失败：${e.message?.take(120)}")
             }
+        }
+
+        val chosen = best
+        if (chosen != null) {
+            plan = chosen
+            currentStep = 1
+            service.postStatus("任务已拆解为 ${chosen.steps.size} 步：${chosen.goal}")
+            android.util.Log.i(
+                "GameMaster",
+                "[plan] 采用计划：${chosen.steps.size} 步，目标 App=${chosen.targetApp}，人工接管=${chosen.humanHandover}：" +
+                    chosen.steps.joinToString(" / ")
+            )
+            delay(600)
+            return
         }
         service.postStatus("规划服务暂不可用，直接开始执行（建议稍后重试以获得分步计划）…")
         delay(800)
@@ -716,14 +770,59 @@ class GameAgent(
                 }
             }
 
-            AgentAction.Type.SWIPE ->
-                service.swipe(
-                    cx(action.x), cy(action.y),
-                    cx(action.x2), cy(action.y2),
-                    action.duration
-                ).also {
-                    android.util.Log.i("GameMaster", "[gesture] swipe $coordMode(${action.x.toInt()},${action.y.toInt()})→(${action.x2.toInt()},${action.y2.toInt()}) → 真机(${cx(action.x).toInt()},${cy(action.y).toInt()})→(${cx(action.x2).toInt()},${cy(action.y2).toInt()}) ok=$it")
+            AgentAction.Type.SWIPE -> {
+                // 模型常给"短滑"（一两百像素），2048/列表按 fling 识别容易漏判。
+                // 在归一化坐标里规整：取主导轴为唯一方向、滑满至少 45% 屏宽/高、
+                // 起止点收进安全边距内，保证任何 App 都能识别为明确的方向手势。
+                val lo = 70f; val hi = 930f; val minLen = 450f
+                var sx = action.x.coerceIn(lo, hi)
+                var sy = action.y.coerceIn(lo, hi)
+                var ex = action.x2.coerceIn(lo, hi)
+                var ey = action.y2.coerceIn(lo, hi)
+                val dx = ex - sx
+                val dy = ey - sy
+                if (kotlin.math.abs(dx) >= kotlin.math.abs(dy)) {
+                    ey = sy
+                    if (kotlin.math.abs(dx) < minLen) {
+                        ex = sx + (if (dx >= 0) minLen else -minLen)
+                    }
+                } else {
+                    ex = sx
+                    if (kotlin.math.abs(dy) < minLen) {
+                        ey = sy + (if (dy >= 0) minLen else -minLen)
+                    }
                 }
+                // 平移整条手势使其落在安全边距内
+                if (ex < lo) { val d = lo - ex; ex += d; sx += d }
+                if (ex > hi) { val d = hi - ex; ex += d; sx += d }
+                if (ey < lo) { val d = lo - ey; ey += d; sy += d }
+                if (ey > hi) { val d = hi - ey; ey += d; sy += d }
+                sx = sx.coerceIn(lo, hi); sy = sy.coerceIn(lo, hi)
+                // 方向重复检测：连续 4 次同方向说明模型在瞎滑（如一直左滑），强制纠偏
+                val dir = if (kotlin.math.abs(ex - sx) >= kotlin.math.abs(ey - sy)) {
+                    if (ex >= sx) "右" else "左"
+                } else {
+                    if (ey >= sy) "下" else "上"
+                }
+                if (recentSwipeDirs.lastOrNull() != dir) recentSwipeDirs.clear()
+                recentSwipeDirs.addLast(dir)
+                if (recentSwipeDirs.size >= 4) {
+                    history.addLast(
+                        "系统：你已连续 ${recentSwipeDirs.size} 次只向$dir 滑动，但棋盘没有产生合并——这个方向当前无效，属于机械重复。" +
+                            "请仔细看清棋盘：找出同一行或同一列上相邻/只隔空格的相同数字，立即换一个能让它们相撞合并的方向（上/下/左/右中的另一个方向），" +
+                            "并在后续几步持续围绕大数字所在的角落布局；不要再重复向$dir 滑动。"
+                    )
+                    android.util.Log.i("GameMaster", "[anti-repeat] 检测到连续 ${recentSwipeDirs.size} 次$dir 滑，已注入换方向纠偏")
+                    recentSwipeDirs.clear()
+                }
+                service.swipe(
+                    cx(sx), cy(sy),
+                    cx(ex), cy(ey),
+                    action.duration.coerceAtMost(300)
+                ).also {
+                    android.util.Log.i("GameMaster", "[gesture] swipe 规整后归一化(${sx.toInt()},${sy.toInt()})→(${ex.toInt()},${ey.toInt()}) → 真机(${cx(sx).toInt()},${cy(sy).toInt()})→(${cx(ex).toInt()},${cy(ey).toInt()}) ok=$it")
+                }
+            }
 
             AgentAction.Type.BACK -> { service.globalBack(); true }
             AgentAction.Type.HOME -> { service.globalHome(); true }
