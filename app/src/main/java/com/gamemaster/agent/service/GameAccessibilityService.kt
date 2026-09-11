@@ -1086,12 +1086,25 @@ class GameAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** 判断某个包是否是桌面启动器（默认桌面包名或常见 launcher 命名） */
+    fun isHomeApp(pkg: String): Boolean {
+        if (pkg.isBlank()) return false
+        if (pkg.contains("launcher", ignoreCase = true) ||
+            pkg.contains("quickstep", ignoreCase = true) ||
+            pkg.endsWith(".home", ignoreCase = true)
+        ) return true
+        return try {
+            val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            @Suppress("DEPRECATION")
+            packageManager.resolveActivity(home, 0)?.activityInfo?.packageName == pkg
+        } catch (_: Exception) { false }
+    }
+
     /**
-     * 按应用名/包名直接启动任意已安装应用（无需在桌面翻图标，最可靠的应用打开方式）。
+     * 按应用名/包名解析已安装应用的包名（不启动）。
      * 匹配顺序：包名完全相同 → 应用名完全相同 → 应用名互相包含。
-     * @return 实际启动的应用显示名；找不到返回 null
      */
-    fun launchApp(target: String): String? {
+    fun resolveAppPackage(target: String): String? {
         val t = target.trim()
         if (t.isBlank()) return null
         return try {
@@ -1107,18 +1120,33 @@ class GameAccessibilityService : AccessibilityService() {
                     val label = it.loadLabel(pm).toString().trim()
                     label.length >= 2 && (label.contains(t) || t.contains(label))
                 }
-                ?: return null
-            val ai = match.activityInfo
-            val launch = Intent(Intent.ACTION_MAIN)
-                .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setClassName(ai.packageName, ai.name)
-                .addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-                )
+            match?.activityInfo?.packageName
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 按应用名/包名直接启动任意已安装应用（无需在桌面翻图标，最可靠的应用打开方式）。
+     * 匹配顺序：包名完全相同 → 应用名完全相同 → 应用名互相包含。
+     * @return 实际启动的应用显示名；找不到返回 null
+     */
+    fun launchApp(target: String): String? {
+        val t = target.trim()
+        if (t.isBlank()) return null
+        return try {
+            val pm = packageManager
+            val pkg = resolveAppPackage(t) ?: return null
+            val launch = pm.getLaunchIntentForPackage(pkg) ?: return null
+            launch.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            )
             startActivity(launch)
-            val label = match.loadLabel(pm).toString()
-            Log.i("GameMaster", "[open_app] '$t' → ${ai.packageName} ($label)")
+            val label = pm.getApplicationLabel(
+                pm.getApplicationInfo(pkg, 0)
+            ).toString()
+            Log.i("GameMaster", "[open_app] '$t' → $pkg ($label)")
             label
         } catch (e: Exception) {
             Log.w("GameMaster", "[open_app] 启动 '$t' 失败：${e.message}")

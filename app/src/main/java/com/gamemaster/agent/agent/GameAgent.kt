@@ -63,6 +63,12 @@ class GameAgent(
     /** 当前已推进到的计划步骤（1 起）；只随模型在屏幕上确认后上报的 plan_step 前进 */
     private var currentStep = 1
 
+    /** 计划目标 App 的包名（执行期跑偏拦截用；解析失败为 null 则不校验） */
+    private var targetPackage: String? = null
+
+    /** 连续处于"错误 App/桌面"的轮数：1 轮提醒，2 轮直接把目标 App 拉回前台 */
+    private var driftRounds = 0
+
     /** 上次已播报的步骤，用于在悬浮窗显示"计划第 N/M 步" */
     private var lastAnnouncedStep = 0
 
@@ -184,8 +190,37 @@ class GameAgent(
         return constraints.filterNot { text.contains(it) }
     }
 
-    /** 开工前先规划：理解任务 → 选 App → 拆步骤。
-     *  规划质量不达标（丢了用户硬约束）时带纠错提示重规划，必要时换备用模型；全失败则无计划执行 */
+    /**
+     * App 跑偏检测：当前前台不是目标 App（也不是系统弹窗/本助手）时纠偏。
+     * @return true 表示系统已直接把目标 App 拉回前台，主循环应跳过本轮决策
+     */
+    private suspend fun driftGuard(): Boolean {
+        val tp = targetPackage ?: return false
+        val ta = plan?.targetApp ?: return false
+        val fg = service.currentPackageName()
+        val systemSafe = fg.isBlank() || fg == service.packageName ||
+            fg == "android" || fg == "com.android.systemui" || fg == "com.android.permissioncontroller"
+        if (systemSafe || fg == tp) {
+            driftRounds = 0
+            return false
+        }
+        driftRounds++
+        val place = if (service.isHomeApp(fg)) "手机桌面" else "另一个应用（包名 $fg）"
+        return if (driftRounds >= 2) {
+            history.addLast("系统：你已经离开目标应用「$ta」跑到了$place。系统已直接重新打开「$ta」，请回到后继续未完成的计划步骤，不要再按 Home 或打开其他应用。")
+            android.util.Log.i("GameMaster", "[drift-guard] 连续 $driftRounds 轮偏离目标（fg=$fg），直接拉回 $ta($tp)")
+            service.postStatus("检测到跑到了$place，已自动拉回「$ta」…")
+            service.launchApp(ta)
+            delay(1800)
+            true
+        } else {
+            history.addLast("系统：当前屏幕是$place，不是任务要求的「$ta」。请立即输出 open_app 打开「$ta」回到任务（不要点桌面图标、不要打开相机/设置等任何其他应用，也不要按 Home），然后继续未完成的计划步骤。")
+            service.postStatus("提醒：当前不在目标 App「$ta」，要求立即返回…")
+            android.util.Log.i("GameMaster", "[drift-guard] 第 $driftRounds 轮偏离目标（fg=$fg），已提醒模型返回 $ta")
+            false
+        }
+    }
+
     private suspend fun makePlan() {
         service.postStatus("正在理解任务并拆解执行步骤…")
         val constraints = extractConstraints(config.task)
@@ -226,6 +261,9 @@ class GameAgent(
         if (chosen != null) {
             plan = chosen
             currentStep = 1
+            // 解析目标 App 包名，用于执行期"跑偏拦截"：AI 只能打开这个 App
+            targetPackage = service.resolveAppPackage(chosen.targetApp)
+            android.util.Log.i("GameMaster", "[plan] 目标 App 解析：${chosen.targetApp} → ${targetPackage ?: "未匹配到包名（将不做包名校验）"}")
             service.postStatus("任务已拆解为 ${chosen.steps.size} 步：${chosen.goal}")
             android.util.Log.i(
                 "GameMaster",
@@ -246,7 +284,7 @@ class GameAgent(
         service.postStatus("AI 助手已启动，正在观察屏幕…")
         var step = 0
 
-        while (coroutineContext.isActive) {
+        mainLoop@ while (coroutineContext.isActive) {
             step++
 
             // 0. 系统级"是否允许打开 XX"确认弹窗（HyperOS/MIUI 后台启动拦截）：
@@ -322,6 +360,10 @@ class GameAgent(
                     service.postStatus("检测到搜索词错误，已要求重新搜索正确关键词…")
                 }
             }
+
+            // App 跑偏检测：当前前台既不是目标 App、也不是系统弹窗/本助手时进行纠偏；
+            // 返回 true 表示本轮已直接拉回目标 App，跳过本轮决策
+            if (driftGuard()) continue
 
             // 4. 调用大模型（连续重复同一动作时附加破环警告）
             val loopNote = if (repeatCount >= 3) {
@@ -849,7 +891,22 @@ class GameAgent(
             }
 
             AgentAction.Type.OPEN_APP -> {
-                val label = service.launchApp(action.appName)
+                // 跑偏拦截：有明确目标 App 时，AI 想打开的若是另一个已安装 App，直接驳回并改开目标 App
+                var wanted = action.appName
+                val tp = targetPackage
+                val ta = plan?.targetApp
+                if (tp != null && ta != null) {
+                    val wantedPkg = service.resolveAppPackage(wanted)
+                    if (wantedPkg != null && wantedPkg != tp) {
+                        history.addLast(
+                            "系统：计划要求全程使用「$ta」，你却要打开别的应用「$wanted」——已忽略该操作并直接为你打开「$ta」。" +
+                                "不要离开目标 App；如果你在桌面，直接 open_app「$ta」即可，不要点桌面图标。"
+                        )
+                        android.util.Log.i("GameMaster", "[drift-guard] 拦截错误 open_app '$wanted'($wantedPkg)，改开 '$ta'($tp)")
+                        wanted = ta
+                    }
+                }
+                val label = service.launchApp(wanted)
                 if (label != null) {
                     // 把真实启动结果反馈给模型，下一轮它就知道当前在哪个应用
                     history.addLast("系统：已成功打开应用「$label」")
