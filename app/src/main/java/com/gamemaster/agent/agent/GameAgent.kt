@@ -358,10 +358,18 @@ class GameAgent(
                     if (p != null && action.planStep > 0) "（模型自报计划第 ${action.planStep}/${p.steps.size} 步，当前=$currentStep）" else ""
             )
 
-            // 计划进度推进：只前进不回退（防止模型慌乱中倒步），跳步超过 1 步先不接受跳跃
+            // 计划进度推进：一次只允许前进一格，模型跳步（2→4）或超出范围时忽略，
+            // 防止它没验证屏幕就一口气把计划走完然后提前 finish
             if (p != null && action.planStep in 1..p.steps.size) {
-                if (action.planStep > currentStep) {
-                    currentStep = action.planStep.coerceAtMost(p.steps.size)
+                if (action.planStep > currentStep + 1) {
+                    history.addLast(
+                        "系统：你上报的 plan_step=${action.planStep} 跳步了（当前是第 $currentStep 步）。" +
+                            "必须先在屏幕上完成并验证当前第 $currentStep 步「${p.steps.getOrNull(currentStep - 1).orEmpty()}」，" +
+                            "确认验证标志出现后才能推进到下一步；本轮仍按第 $currentStep 步执行。"
+                    )
+                    service.postStatus("计划 $currentStep/${p.steps.size}：模型试图跳步到 ${action.planStep}，已要求逐格推进")
+                } else if (action.planStep == currentStep + 1) {
+                    currentStep = action.planStep
                     val stepText = p.steps.getOrNull(currentStep - 1).orEmpty()
                     history.addLast(
                         "系统：你已进入计划第 $currentStep/${p.steps.size} 步——$stepText。" +
