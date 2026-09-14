@@ -1,128 +1,128 @@
-# GameMaster · AI 手机任务助手
+# GameMaster · AI Phone Task Assistant
 
-> 基于视觉大模型的 Android 自动化助手 —— 用一句话描述任务，它自己观察屏幕、拆解步骤、点击滑动，直到完成。
+> A vision-model-driven Android automation assistant — describe a task in one sentence, and it observes the screen, breaks the task into steps, and performs taps, swipes, and text input until the job is done.
 
-A vision-model-driven Android automation assistant. Describe your task in one sentence, and it observes the screen, breaks the task into steps, and performs taps/swipes until done.
-
----
-
-## ✨ 功能特性 / Features
-
-### 🤖 通用任务执行
-- **自然语言任务**：输入"帮我打开计算器""下载小红书""在应用宝里搜王者荣耀"等，全自动完成
-- **任务规划**：先由大模型把任务拆解成有序步骤计划，再逐步执行，每步带验证标志
-- **多应用支持**：打开应用、搜索、下载安装、游戏操作、日常操作等
-
-### 🛡️ 防死循环机制（核心）
-- **语义打转检测**：不止检测"同坐标重复点击"，还能识别"换位置做同一件事""两个页面间来回横跳"等语义级死循环
-- **自动脱困阶梯**：卡住时按层级自救 —— 按返回 → 基于当前屏幕重新规划 → 切换备用模型 → 重启应用
-- **画面重规划**：原计划走不通时，截取当前真实画面让大模型重新拆解任务
-- **看门狗停机**：多次重规划仍无进展时明确报错停止，不无限空转
-
-### ✅ 完成证据闸门
-- **视觉复核**：任务结束前必须由独立视觉核验确认屏幕上存在目标证据，杜绝"假完成"
-- **确定性判定**："打开应用"类任务用前台包名做铁证判定，不依赖视觉模型
-- **计划进度校验**：未走完所有计划步骤时禁止 finish
-
-### 🔧 系统托管能力
-- **搜索托管**：自动识别搜索框，代输入关键词并提交（绕过自绘假搜索框、剪贴板限制等问题）
-- **下载托管**：检测到下载任务时自动接管应用商店搜索、APK 下载与 `pm install` 安装流程
-- **目标包名映射**：内置常见应用包名映射表
-
-### 🎮 游戏专属优化
-- **空滑转向**：2048 等合成游戏中，模型选的方向无效时系统自动换方向，不卡死
-- **重开检测**：游戏结束时自动识别"再来一局"按钮并点击
+视觉大模型驱动的 Android 自动化助手。[中文文档](README.zh-CN.md)
 
 ---
 
-## 📸 截图 / Screenshots
+## ✨ Features
 
-| 主界面配置 | 应用抽屉 + 悬浮球 |
+### 🤖 General-Purpose Task Execution
+- **Natural language tasks**: Type things like "open the calculator", "download Xiaohongshu", or "search for Honor of Kings in the app store" — fully automated.
+- **Task planning**: The vision model first decomposes the task into an ordered step-by-step plan with per-step verification signals, then executes them one by one.
+- **Broad applicability**: Launch apps, search, download & install, play games, routine UI operations, and more.
+
+### 🛡️ Anti-Loop Mechanism (the core)
+- **Semantic loop detection**: Beyond catching "repeated taps at the same coordinates", it recognizes semantic dead loops such as "doing the same ineffective thing at different positions" and "bouncing back and forth between two screens".
+- **Escalating self-recovery**: When stuck, it rescues itself in escalating stages — press Back → replan from the current screen → switch to a fallback vision model → restart the app.
+- **On-screen replanning**: When the original plan doesn't work, it captures the current real screen and asks the model to decompose a new plan from there.
+- **Watchdog stop**: If multiple replans still make no progress, it stops with a clear error instead of spinning forever and burning API tokens.
+
+### ✅ Evidence-Based Completion Gate
+- **Independent visual verification**: Before finishing, a separate vision check must confirm the target evidence is visible on screen — no more "fake completion".
+- **Deterministic checks**: "Open an app" tasks are verified against the foreground package name as hard evidence, without relying on the vision model.
+- **Plan progress check**: `finish` is rejected until every planned step is completed.
+
+### 🔧 System-Hosted Capabilities
+- **Search hosting**: Automatically identifies the search box, enters the keyword, and submits — working around self-drawn fake search boxes and clipboard restrictions.
+- **Download hosting**: For download tasks, it takes over the app-store flow — search, APK download detection, and `pm install`.
+- **Package name mapping**: Built-in mapping for common apps.
+
+### 🎮 Game-Specific Optimizations
+- **Dead-swipe redirection**: In merge games like 2048, when the model's chosen swipe direction has no effect, the system automatically tries another direction.
+- **Restart detection**: Automatically recognizes and taps the "play again" button when a game ends.
+
+---
+
+## 📸 Screenshots
+
+| Main UI (configuration) | App drawer + floating ball |
 |:---:|:---:|
 | ![Main UI](screenshots/main_ui.png) | ![App Drawer](screenshots/app_drawer.png) |
 
 ---
 
-## 🔧 安装方法 / Installation
+## 🔧 Installation
 
-### 环境要求 / Requirements
-- Android 10 (API 29) 及以上
-- 已 root（推荐，用于截屏；非 root 可走屏幕录制授权）
-- Android Studio / JDK 11+（自行构建时）
+### Requirements
+- Android 10 (API 29) or higher
+- Root access recommended (for screenshots; non-root devices can use the screen-recording grant instead)
+- Android Studio / JDK 11+ if building from source
 
-### 方法一：自行构建 / Build from source
+### Option 1: Build from source
 
 ```bash
-# 1. 克隆仓库
+# 1. Clone the repository
 git clone https://github.com/moon-sky/gamemaster.git
 cd gamemaster
 
-# 2. 本地配置 SDK 路径（编辑 local.properties）
+# 2. Configure your SDK path (edit local.properties)
 echo "sdk.dir=/path/to/your/android-sdk" > local.properties
 
-# 3. 构建 Debug APK
+# 3. Build the debug APK
 ./gradlew :app:assembleDebug
 
-# 4. 安装到设备
+# 4. Install on your device
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### 方法二：使用预构建 APK
-下载 Releases 中的 APK，直接安装到设备。
+### Option 2: Pre-built APK
+Download the APK from [Releases](../../releases) and install it directly.
 
-### 首次配置 / First-time setup
+### First-time setup
 
-1. **开启权限**（在应用内依次点击）：
-   - 无障碍服务（必须，用于读取界面和执行操作）
-   - 悬浮窗权限（必须，用于悬浮球控制）
-   - 屏幕录制授权（Android 10 截屏用；root 设备可跳过）
+1. **Grant permissions** (tap each button in the app):
+   - Accessibility Service (required — reads the UI tree and performs actions)
+   - Overlay / Display over other apps (required — the floating control ball)
+   - Screen recording grant (for screenshots on Android 10; can be skipped on rooted devices)
 
-2. **配置 AI 视觉接口**：
-   - API 地址：支持 OpenAI 兼容协议的视觉模型接口（如智谱 `https://open.bigmodel.cn/api/paas/v4`）
-   - API Key：你的模型服务密钥
-   - 视觉模型名称：如 `glm-4.6v-flash`、`qwen-vl-max` 等
+2. **Configure the AI vision endpoint**:
+   - API Base URL: any OpenAI-compatible vision API (e.g. Zhipu `https://open.bigmodel.cn/api/paas/v4`)
+   - API Key: your model service key
+   - Vision model name: e.g. `glm-4.6v-flash`, `qwen-vl-max`, etc.
 
-3. **输入任务**：在任务输入框写下你要做的事，点击开始
+3. **Enter your task** in the input box and press start.
 
 ---
 
-## 🏗️ 架构 / Architecture
+## 🏗️ Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
-│                  MainActivity               │  ← 任务输入 + 模型配置 + 权限管理
+│                  MainActivity               │  ← task input, model config, permissions
 └──────────────────┬──────────────────────────┘
                    │
 ┌──────────────────▼──────────────────────────┐
-│              GameAccessibilityService        │  ← 无障碍服务：读取 UI 树、执行点击/滑动
+│              GameAccessibilityService        │  ← UI tree reading, taps/swipes/input
 └──────────────────┬──────────────────────────┘
                    │
 ┌──────────────────▼──────────────────────────┐
-│                  GameAgent                   │  ← 主循环：规划 → 观察 → 决策 → 执行 → 验证
+│                  GameAgent                   │  ← main loop: plan → observe → decide → act → verify
 │  ┌────────────┐ ┌──────────┐ ┌────────────┐ │
-│  │  makePlan  │ │ VisionAPI│ │  HealthCheck│ │  ← 任务规划 / 视觉决策 / 死循环监测
+│  │  makePlan  │ │ VisionAPI│ │  HealthCheck│ │  ← planning / vision decision / loop monitor
 │  └────────────┘ └──────────┘ └────────────┘ │
 │  ┌────────────┐ ┌──────────┐ ┌────────────┐ │
-│  │  SystemHost│ │ Evidence │ │  Recovery  │ │  ← 系统托管 / 证据闸门 / 脱困阶梯
+│  │  SystemHost│ │ Evidence │ │  Recovery  │ │  ← system hosting / evidence gate / recovery
 │  └────────────┘ └──────────┘ └────────────┘ │
 └─────────────────────────────────────────────┘
 ```
 
-### 核心循环
-1. **规划**：大模型将自然语言任务拆解为有序步骤
-2. **观察**：截屏 + 无障碍树收集当前屏幕状态
-3. **决策**：大模型根据画面和计划输出下一步动作（点击/滑动/输入/返回/打开应用/完成）
-4. **执行**：无障碍服务执行动作；系统托管（搜索/下载）在特定阶段接管
-5. **验证**：检测任务是否完成；若卡住，触发脱困机制
+### Core loop
+1. **Plan** — the model decomposes the natural-language task into ordered steps.
+2. **Observe** — screenshot plus accessibility tree describe the current screen.
+3. **Decide** — the model outputs the next action (tap / swipe / input / back / open app / finish).
+4. **Act** — the accessibility service executes it; system hosting takes over for search/download stages.
+5. **Verify** — check whether the task is complete; if stuck, trigger the recovery mechanism.
 
 ---
 
-## 🔐 隐私与安全 / Privacy & Security
+## 🔐 Privacy & Security
 
-- **所有屏幕数据仅发送至你配置的视觉模型 API**，不经任何第三方中转
-- **API Key 存储在应用本地 SharedPreferences**，不上传
-- 应用需要无障碍、悬浮窗、截屏权限——这些权限仅用于执行自动化任务
-- 建议在专用测试设备上使用
+- **Screen data is sent only to the vision API endpoint you configure** — no third-party relay.
+- **Your API key is stored locally** in the app's SharedPreferences and is never uploaded elsewhere.
+- Accessibility, overlay, and screenshot permissions are used solely for automation.
+- We recommend running this on a dedicated test device.
 
 ---
 
@@ -132,12 +132,12 @@ MIT License
 
 ---
 
-## 🤝 贡献 / Contributing
+## 🤝 Contributing
 
-欢迎提 Issue 和 PR！
-- Bug 反馈请附带设备型号、Android 版本、任务描述和日志
-- 新功能建议请先开 Issue 讨论
+Issues and PRs are welcome!
+- For bug reports, please include the device model, Android version, task description, and logs.
+- For new features, please open an issue for discussion first.
 
 ---
 
-> ⚠️ **免责声明**：本工具仅供学习研究和合法自动化测试使用。请勿用于违反应用服务条款的行为。
+> ⚠️ **Disclaimer**: This tool is intended for learning, research, and legitimate automation testing only. Do not use it in ways that violate any application's terms of service.
