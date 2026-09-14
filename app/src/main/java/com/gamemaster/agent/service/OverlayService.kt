@@ -272,6 +272,25 @@ class OverlayService : Service() {
             ballView?.backgroundTintList = tint
             (ballView as? android.widget.TextView)?.setTextColor(0xFFFFFFFF.toInt())
         }
+        // 执行中：悬浮球缩小、半透明并贴到左上角状态栏区域，避免遮挡游戏/应用内容
+        // （它会被截进截图，挡住棋盘格子会干扰 AI 判断；也可能吞掉落点附近的触摸）
+        ballView?.let { v ->
+            val lp = runCatching { v.layoutParams as? WindowManager.LayoutParams }.getOrNull()
+            if (lp != null) {
+                val running = state == AgentState.RUNNING
+                val targetSize = if (running) dp(30) else dp(52)
+                var changed = false
+                if (lp.width != targetSize || lp.height != targetSize) {
+                    lp.width = targetSize; lp.height = targetSize; changed = true
+                }
+                val tx = if (running) dp(6) else dp(16)
+                val ty = if (running) dp(6) else dp(280)
+                if (lp.x != tx || lp.y != ty) { lp.x = tx; lp.y = ty; changed = true }
+                val ta = if (running) 0.55f else 1f
+                if (v.alpha != ta) { v.alpha = ta; changed = true }
+                if (changed) runCatching { wm.updateViewLayout(v, lp) }
+            }
+        }
         refreshToggle()
     }
 

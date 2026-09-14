@@ -1,3 +1,6 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -13,7 +16,8 @@ android {
         minSdk = 29
         targetSdk = 31
         versionCode = 1
-        versionName = "1.0"
+        // 版本号取构建时刻：月日时分，如 09111920
+        versionName = SimpleDateFormat("MMddHHmm").format(Date())
     }
 
     buildTypes {

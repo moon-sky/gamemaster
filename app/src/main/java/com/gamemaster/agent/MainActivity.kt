@@ -13,6 +13,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.gamemaster.agent.BuildConfig
 import com.gamemaster.agent.databinding.ActivityMainBinding
 import com.gamemaster.agent.prefs.Prefs
 import com.gamemaster.agent.screenshot.RootUtil
@@ -28,6 +29,8 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        binding.tvVersion.text = "版本号：${BuildConfig.VERSION_NAME}"
 
         // 运行中屏幕熄灭/锁屏时被服务拉起：直接亮屏、越过无密码锁屏，然后回桌面
         if (intent?.getBooleanExtra(EXTRA_WAKE_UNLOCK, false) == true) {

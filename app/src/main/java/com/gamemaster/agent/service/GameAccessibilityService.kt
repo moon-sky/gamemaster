@@ -2,6 +2,7 @@ package com.gamemaster.agent.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Path
@@ -93,13 +94,14 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
-        stopAgent()
+        // 系统临时解绑/重建服务不算"用户手动停止"：保留 shouldRun 标志，重新绑定后自动续跑
+        stopAgent(manual = false)
         instance = null
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
-        stopAgent()
+        stopAgent(manual = false)
         instance = null
         scope.cancel()
         super.onDestroy()
@@ -107,9 +109,10 @@ class GameAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         // 记录前台应用包名，供 AI 判断当前界面（本服务主要靠截屏理解画面）
+        val self = packageName
         event?.packageName?.let { pkg ->
             val name = pkg.toString()
-            if (name.isNotBlank() && name != "android" && name != "com.android.systemui") {
+            if (name.isNotBlank() && name != "android" && name != "com.android.systemui" && name != self) {
                 lastPackage = name
             }
         }
@@ -117,7 +120,18 @@ class GameAccessibilityService : AccessibilityService() {
 
     /** 当前前台应用包名：优先取活动窗口根节点，其次取最近事件记录 */
     fun currentPackageName(): String {
-        rootInActiveWindow?.packageName?.toString()?.takeIf { it.isNotBlank() }?.let { return it }
+        // 优先用最上层的 TYPE_APPLICATION 窗口判断前台应用；rootInActiveWindow 在应用切后台
+        // 或有悬浮窗时经常不准，导致下载托管反复误判"不在目标 App"
+        // 排除自身包名：GameMaster 的透明/悬浮窗口经常盖在目标应用上面并抢走焦点
+        val self = packageName
+        try {
+            val top = windows
+                .filter { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION }
+                .filter { it.root?.packageName?.toString() != self }
+                .maxByOrNull { it.layer }
+            top?.root?.packageName?.toString()?.takeIf { it.isNotBlank() }?.let { return it }
+        } catch (_: Exception) { }
+        rootInActiveWindow?.packageName?.toString()?.takeIf { it.isNotBlank() && it != self }?.let { return it }
         return lastPackage
     }
 
@@ -156,6 +170,38 @@ class GameAccessibilityService : AccessibilityService() {
         false
     }
 
+    /**
+     * 系统级搜索结果证据：关键词出现在顶部搜索栏以下（结果列表区），
+     * 且同屏有至少一个"结果型"信号（下载/安装/联系人/商品等），
+     * 用于"结果出来就停"类任务绕开弱模型的错误判断直接验收。
+     */
+    suspend fun searchResultEvidence(keyword: String): Boolean = withContext(Dispatchers.Main) {
+        val root = activeAppRoot() ?: return@withContext false
+        val kw = keyword.trim()
+        if (kw.isBlank()) return@withContext false
+        val markers = listOf(
+            "下载", "安装", "次下载", "秒玩", "联系人", "聊天", "公众号", "小程序",
+            "功能", "播放", "评论", "评分", "商品", "店铺", "网页", "关注", "万粉"
+        )
+        var kwInBody = false
+        var marker = false
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        while (q.isNotEmpty() && n < 600) {
+            val node = q.removeFirst(); n++
+            val t = node.text?.toString().orEmpty()
+            val d = node.contentDescription?.toString().orEmpty()
+            val all = "$t $d"
+            val r = Rect(); node.getBoundsInScreen(r)
+            if (r.top > 220 && (t.contains(kw) || d.contains(kw))) kwInBody = true
+            if (markers.any { all.contains(it) }) marker = true
+            if (kwInBody && marker) return@withContext true
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        false
+    }
+
     /** 真机屏幕像素尺寸（无截图轮次做归一化换算用） */
     fun realScreenSize(): Pair<Int, Int> {
         val dm = resources.displayMetrics
@@ -163,7 +209,7 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        stopAgent()
+        stopAgent(manual = false)
     }
 
     // ---------------- 状态 ----------------
@@ -204,12 +250,16 @@ class GameAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun stopAgent() {
+    /**
+     * @param manual true=用户/界面主动停止（清除自动恢复标志）；
+     *               false=系统解绑/销毁等非用户原因（保留标志，服务重连后自动续跑）
+     */
+    fun stopAgent(manual: Boolean = true) {
         val wasRunning = agentJob?.isActive == true
-        Prefs.setAgentShouldRun(this, false)
+        if (manual) Prefs.setAgentShouldRun(this, false)
         agentJob?.cancel()
         agentJob = null
-        if (wasRunning) setState(AgentState.STOPPED, "已手动停止。")
+        if (manual && wasRunning) setState(AgentState.STOPPED, "已手动停止。")
     }
 
     /** 主循环结束时回调：清除自动恢复标记 */
@@ -271,6 +321,14 @@ class GameAccessibilityService : AccessibilityService() {
                 }
             )
         }
+    }
+
+    /** 设备当前是否停在锁屏/Keyguard（截屏不会失败，但画面是锁屏，任务无法推进） */
+    fun isLocked(): Boolean = try {
+        val km = getSystemService(android.content.Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
+        km.isKeyguardLocked || km.inKeyguardRestrictedInputMode()
+    } catch (e: Exception) {
+        false
     }
 
     /**
@@ -391,13 +449,15 @@ class GameAccessibilityService : AccessibilityService() {
     // ---------------- 按键与输入 ----------------
 
     fun globalBack() {
-        if (RootUtil.isRooted() && RootUtil.keyEvent(4)) return
-        performGlobalAction(GLOBAL_ACTION_BACK)
+        // 无障碍全局返回优先：系统级 API，不留 input shell 痕迹（应用宝等反自动化
+        // 会检测 `input keyevent` 命令并直接退后台，导致"越救越卡"）；root keyevent 只作兜底
+        if (performGlobalAction(GLOBAL_ACTION_BACK)) return
+        if (RootUtil.isRooted()) RootUtil.keyEvent(4)
     }
 
     fun globalHome() {
-        if (RootUtil.isRooted() && RootUtil.keyEvent(3)) return
-        performGlobalAction(GLOBAL_ACTION_HOME)
+        if (performGlobalAction(GLOBAL_ACTION_HOME)) return
+        if (RootUtil.isRooted()) RootUtil.keyEvent(3)
     }
 
     /** 在当前聚焦的输入框中设置文字（只填字，不自动发送） */
@@ -405,47 +465,167 @@ class GameAccessibilityService : AccessibilityService() {
         if (text.isBlank()) return@withContext false
         val root = activeAppRoot() ?: return@withContext false
         val field = findVisibleEditable(root, topAreaOnly = false)
-        if (field == null) {
-            Log.w("GameMaster", "[input] 当前界面没有可输入的文本框（需要先点击输入框聚焦）")
-            return@withContext false
+        if (field != null) {
+            return@withContext setFieldText(field, text)
         }
-        setFieldText(field, text)
+        // 没有 EditText：可能是自绘输入框（如应用宝搜索框）。
+        // 用剪贴板粘贴：复制到剪贴板 → 对当前焦点节点执行 ACTION_PASTE。
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+            cm?.setPrimaryClip(android.content.ClipData.newPlainText("gm_input", text))
+            val focus = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: root
+            // ACTION_PASTE 常量值 16
+            val pasted = focus.performAction(16) // AccessibilityNodeInfo.ACTION_PASTE
+            if (pasted) {
+                Log.i("GameMaster", "[input] 剪贴板粘贴成功: ${text.take(20)}")
+                return@withContext true
+            }
+        } catch (e: Exception) {
+            Log.w("GameMaster", "[input] 剪贴板粘贴失败: ${e.message}")
+        }
+        Log.w("GameMaster", "[input] 当前界面没有可输入的文本框（需要先点击输入框聚焦）")
+        false
     }
 
     /**
-     * 一键搜索：确保搜索框存在 → 写入关键词（带校验/粘贴兜底）→ 提交
-     * （先尝试输入法回车 ACTION_IME_ENTER，再尝试直接点"搜索"按钮）。
+     * 非破坏性探测：当前界面是否具备"提交一次搜索"的入口。
+     * 顶部有真实输入框，或顶部有可点的关键词框/"搜索"入口（点完能进入搜索编辑页），即视为可以。
+     * 供 Agent 在搜索步做"系统托管搜索"前判断，避免在完全没有搜索入口的页面乱点。
      */
+    suspend fun canSubmitSearch(): Boolean = withContext(Dispatchers.Main) {
+        val root = activeAppRoot() ?: return@withContext false
+        if (findVisibleEditable(root, topAreaOnly = true) != null) return@withContext true
+        findKeywordBoxNode(root) != null || findTopSearchEntryNode(root) != null
+    }
+
     suspend fun submitSearch(keyword: String): Boolean = withContext(Dispatchers.Main) {
         if (keyword.isBlank()) return@withContext false
-        val root0 = activeAppRoot() ?: return@withContext false
+        var root0 = activeAppRoot() ?: return@withContext false
         // 只要顶部标题栏区域的可见输入框；结果页底部"问点点/AI"之类的输入框绝不能当作搜索框
         var field = findVisibleEditable(root0, topAreaOnly = true)
-        // 当前页没有顶部输入框（如小红书首页/搜索结果页，搜索框是个 TextView）：
-        // 自动点顶部关键词框/"搜索"入口进入搜索编辑页，再找一次
+        // 当前页没有顶部输入框（如应用宝首页，搜索框是自绘 TextView）：
+        // 自动点顶部搜索入口进入搜索编辑页，再找一次
         if (field == null) {
-            if (tapSearchWayIn(root0)) {
-                Log.i("GameMaster", "[search] 当前页无输入框，已进入搜索入口")
+            // 自绘搜索框：用 dispatchGesture 点击搜索框中心，确保进入编辑模式
+            var entryNode = findTopSearchEntryNode(root0)
+            // 应用宝刚启动时搜索框可能未加载，重试几次
+            var retry = 0
+            while (entryNode == null && retry < 3) {
                 delay(1000)
+                val retryRoot = activeAppRoot() ?: break
+                entryNode = findTopSearchEntryNode(retryRoot)
+                if (entryNode != null) root0 = retryRoot
+                retry++
+            }
+            Log.i("GameMaster", "[search] findTopSearchEntryNode=${entryNode?.className} desc=${entryNode?.contentDescription}")
+            if (entryNode != null) {
+                val er = Rect()
+                entryNode.getBoundsInScreen(er)
+                val cx = er.left + er.width() / 2
+                val cy = er.top + er.height() / 2
+                Log.i("GameMaster", "[search] 搜索框 bounds=[$er] 中心=($cx,$cy)")
+                // 用 dispatchGesture 直接点击（绕过 RootUtil，避免 input tap 对自绘控件无效）
+                val stroke = GestureDescription.StrokeDescription(
+                    android.graphics.Path().apply { moveTo(cx.toFloat(), cy.toFloat()) },
+                    0L, 80L
+                )
+                dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+                delay(1500)
+                Log.i("GameMaster", "[search] 点击后 delay 完成，查找 EditText")
                 val fresh = activeAppRoot()
-                if (fresh != null) field = findVisibleEditable(fresh, topAreaOnly = true)
+                Log.i("GameMaster", "[search] fresh root=${fresh?.packageName}")
+                if (fresh != null) {
+                    root0 = fresh
+                    field = findVisibleEditable(fresh, topAreaOnly = true)
+                    Log.i("GameMaster", "[search] findVisibleEditable=$field")
+                }
+            } else {
+                if (tapSearchWayIn(root0)) {
+                    Log.i("GameMaster", "[search] 当前页无输入框，已进入搜索入口")
+                    delay(1200)
+                    val fresh = activeAppRoot()
+                    if (fresh != null) {
+                        root0 = fresh
+                        field = findVisibleEditable(fresh, topAreaOnly = true)
+                    }
+                }
             }
         }
-        if (field == null) {
-            Log.w("GameMaster", "[search] 当前界面顶部没有搜索输入框")
-            return@withContext false
+        if (field != null) {
+            // 标准 EditText：直接 setFieldText + 提交
+            if (!setFieldText(field, keyword)) return@withContext false
+            submitSearchByEnter(field)
+            delay(2000)
+            Log.i("GameMaster", "[search] 提交后当前包名=${currentPackageName()}")
+            // 不自动点击下载按钮（搜索结果页有广告，容易点错），让模型来点击
+        } else {
+            // 自绘搜索框（应用宝等）：找到搜索框节点本身，用 ACTION_SET_TEXT 设置文字
+            Log.i("GameMaster", "[search] 无 EditText，尝试 ACTION_SET_TEXT 设置关键词")
+            // 打印所有含"搜索"的节点，便于调试
+            val r = Rect()
+            var searchField: AccessibilityNodeInfo? = null
+            val q = ArrayDeque<AccessibilityNodeInfo>()
+            q.add(root0)
+            var n = 0
+            while (q.isNotEmpty() && n < 500) {
+                val node = q.removeFirst()
+                n++
+                val d = node.contentDescription?.toString()?.trim().orEmpty()
+                val t = node.text?.toString()?.trim().orEmpty()
+                if ((d.startsWith("搜索") || t.startsWith("搜索")) && d.contains("编辑框")) {
+                    node.getBoundsInScreen(r)
+                    if (r.top < 300) { searchField = node; break }
+                }
+                for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+            }
+            // 兜底：找任何含"搜索"的可编辑节点
+            if (searchField == null) {
+                val q2 = ArrayDeque<AccessibilityNodeInfo>()
+                q2.add(root0)
+                var m = 0
+                while (q2.isNotEmpty() && m < 500) {
+                    val node = q2.removeFirst()
+                    m++
+                    val d = node.contentDescription?.toString()?.trim().orEmpty()
+                    val t = node.text?.toString()?.trim().orEmpty()
+                    if ((d.startsWith("搜索") || t.startsWith("搜索"))) {
+                        node.getBoundsInScreen(r)
+                        if (r.top < 300) { searchField = node; break }
+                    }
+                    for (i in 0 until node.childCount) node.getChild(i)?.let { q2.add(it) }
+                }
+            }
+            val setOk = if (searchField != null) {
+                val args = android.os.Bundle()
+                args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, keyword)
+                searchField.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            } else false
+            Log.i("GameMaster", "[search] ACTION_SET_TEXT setOk=$setOk fieldClass=${searchField?.className} fieldDesc=${searchField?.contentDescription}")
+            if (!setOk) {
+                // 兜底：剪贴板粘贴（Android 10+ 可能因非焦点应用失败）
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                cm?.setPrimaryClip(android.content.ClipData.newPlainText("gm_search", keyword))
+                val focus = activeAppRoot()?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                focus?.performAction(16) // ACTION_PASTE
+            }
+            delay(600)
+            // 提交：找"搜索"按钮点击，或发回车
+            submitSearchByEnter(null)
         }
-        if (!setFieldText(field, keyword)) return@withContext false
+        true
+    }
 
-        // 提交方式 1：输入法回车 ACTION_IME_ENTER（API 30 隐藏常量，反射取值）
+    private fun submitSearchByEnter(field: AccessibilityNodeInfo?): Boolean {
         var submitted = false
-        try {
-            val imeEnter = AccessibilityNodeInfo::class.java
-                .getField("ACTION_IME_ENTER").getInt(null)
-            submitted = field.performAction(imeEnter)
-        } catch (_: Throwable) { }
-
-        // 提交方式 2：在应用窗口树上找"搜索"按钮并点击（键盘弹出时活动根可能是输入法窗口）
+        if (field != null) {
+            try {
+                val imeEnter = AccessibilityNodeInfo::class.java
+                    .getField("ACTION_IME_ENTER").getInt(null)
+                submitted = field.performAction(imeEnter)
+            } catch (_: Throwable) { }
+            Log.i("GameMaster", "[search] ACTION_IME_ENTER submitted=$submitted")
+        }
+        // 不用 input keyevent（会导致应用宝退后台），改找搜索按钮点击
         if (!submitted) {
             val fresh = activeAppRoot()
             if (fresh != null) {
@@ -457,11 +637,12 @@ class GameAccessibilityService : AccessibilityService() {
                     n++
                     val t = node.text?.toString().orEmpty().trim()
                     val d = node.contentDescription?.toString().orEmpty().trim()
-                    if (t == "搜索" || t.equals("Search", true) || d == "搜索") {
+                    if (t == "搜索" || t.equals("Search", true) || d == "搜索" || d.startsWith("搜索")) {
+                        Log.i("GameMaster", "[search] 找到搜索按钮 t=$t d=$d clickable=${node.isClickable}")
                         var cur: AccessibilityNodeInfo? = node
                         var hops = 0
                         while (cur != null && hops < 4) {
-                            if (cur!!.isClickable &&
+                            if (cur.isClickable &&
                                 cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                             ) {
                                 submitted = true
@@ -474,9 +655,9 @@ class GameAccessibilityService : AccessibilityService() {
                     for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
                 }
             }
+            Log.i("GameMaster", "[search] 搜索按钮点击 submitted=$submitted")
         }
-        Log.i("GameMaster", "[search] 关键词「$keyword」提交 submitted=$submitted")
-        submitted
+        return submitted
     }
 
     /**
@@ -500,43 +681,69 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 在没有输入框的页面想办法进入搜索编辑页：
-     *  1) 搜索结果页：优先点击顶部标题栏里显示着"当前关键词"的框（小红书/抖音都是点击它回编辑页），
-     *     不能点右侧"搜索"按钮——那只会用错误关键词再搜一次；
-     *  2) 首页/其他页：退化为点击文字恰好为"搜索"的顶部入口。
+     * 只找不点：顶部标题栏里"显示着当前关键词的可点击长框"（结果页点它回搜索编辑页）。
+     * 美团/大众点评/小红书首页的自绘搜索框也走这个：框内有占位/历史词文本，
+     * 父容器可点击且足够宽。取最宽的候选。
      */
-    private fun tapSearchWayIn(root: AccessibilityNodeInfo): Boolean {
-        data class Cand(val node: AccessibilityNodeInfo, val width: Int)
+    private fun findKeywordBoxNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        data class Cand(val node: AccessibilityNodeInfo, val score: Int, val top: Int)
         val boxCands = mutableListOf<Cand>()
         val blocked = setOf("搜索", "Search", "返回", "取消", "问点点", "问ai")
         val q = ArrayDeque<AccessibilityNodeInfo>()
         q.add(root)
         var n = 0
+        fun encloseBar(node: AccessibilityNodeInfo, hintScore: Int) {
+            var cur: AccessibilityNodeInfo? = node
+            var hops = 0
+            while (cur != null && hops < 4) {
+                val r = Rect()
+                cur.getBoundsInScreen(r)
+                // 顶部标题栏区域（y<520）的可点击长条：高 24~200（横屏下假框可能只有 30+px 高），
+                // 宽>=180；排除整屏可点击根容器（高>=200 的那种）
+                if (cur.isClickable && r.top in 0..520 && r.width() >= 180 && r.height() in 24..200) {
+                    // 越靠上越像搜索框；desc 直接带"搜索"前缀的（如应用宝"搜索  红果免费短剧"）强加分
+                    boxCands.add(Cand(cur, hintScore * 1000 - r.top, r.top))
+                    break
+                }
+                cur = cur.parent
+                hops++
+            }
+        }
+        val rr = Rect()
+        root.getBoundsInScreen(rr)
+        val screenW = rr.width().coerceAtLeast(320)
         while (q.isNotEmpty() && n < 500) {
             val node = q.removeFirst()
             n++
             val t = node.text?.toString()?.trim().orEmpty()
             val d = node.contentDescription?.toString()?.trim().orEmpty()
+            // 信号 1：描述就是"搜索  xxx"（应用宝首页轮播假词框）
+            if (d.startsWith("搜索") && d.length > 2 && d.length <= 40) {
+                encloseBar(node, 2)
+            }
+            // 信号 2：顶部有 2~40 字提示词的可点击长条（美团/大众点评式假框）
             if (t.isNotBlank() && t !in blocked && d !in blocked && t.length in 2..40) {
-                var cur: AccessibilityNodeInfo? = node
-                var hops = 0
-                while (cur != null && hops < 4) {
-                    val r = Rect()
-                    cur.getBoundsInScreen(r)
-                    // 只要顶部标题栏区域（y<520）的可点击长文本框
-                    if (cur.isClickable && r.top in 0..520 && r.width() > 200 && r.height() > 40) {
-                        boxCands.add(Cand(cur, r.width()))
-                        break
-                    }
-                    cur = cur.parent
-                    hops++
+                encloseBar(node, 1)
+            }
+            // 信号 3：纯几何特征——轮播提示词偶尔为空，此时靠形状也能认出：
+            // 顶部标题栏里横向长条（宽>=180 且不贴屏幕两边），薄（24~120px），不可滚动
+            if (node.isClickable && !node.isScrollable) {
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                if (r.top in 8..150 && r.height() in 24..120 &&
+                    r.width() in 180..(screenW - 40) && r.left >= 40 && r.right <= screenW - 40
+                ) {
+                    boxCands.add(Cand(node, -5000 - r.top, r.top))
                 }
             }
             for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
         }
-        // 最宽的那个就是关键词框
-        boxCands.maxByOrNull { it.width }?.let {
-            val clicked = it.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        return boxCands.maxByOrNull { it.score }?.node
+    }
+
+    private fun tapSearchWayIn(root: AccessibilityNodeInfo): Boolean {
+        findKeywordBoxNode(root)?.let {
+            val clicked = it.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             Log.i("GameMaster", "[search] 点击顶部关键词框回编辑页 ok=$clicked")
             if (clicked) return true
         }
@@ -544,11 +751,10 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 在没有输入框的页面点击顶部"搜索"入口（小红书首页/结果页的搜索框是一个 TextView，
-     * 抖音首页是放大镜）。只认文字/描述恰好为"搜索"的节点，避免误点"拍照搜索/AI搜索"。
-     * 多个候选时取屏幕最靠上的（标题栏入口）。
+     * 只找不点：顶部文字/描述恰好为"搜索"的入口（小红书首页的 TextView、放大镜按钮）。
+     * 避免误点"拍照搜索/AI搜索"。多个候选取屏幕最靠上的（标题栏入口）。
      */
-    private fun tapTopSearchEntry(root: AccessibilityNodeInfo): Boolean {
+    private fun findTopSearchEntryNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         data class Cand(val node: AccessibilityNodeInfo, val top: Int)
         val cands = mutableListOf<Cand>()
         val q = ArrayDeque<AccessibilityNodeInfo>()
@@ -559,7 +765,10 @@ class GameAccessibilityService : AccessibilityService() {
             n++
             val t = node.text?.toString()?.trim().orEmpty()
             val d = node.contentDescription?.toString()?.trim().orEmpty()
-            if (t == "搜索" || t.equals("Search", true) || d == "搜索") {
+            // 匹配"搜索"按钮或搜索框（content-desc 如"搜索  QQ音乐"、text 如"搜索"）
+            val isSearchEntry = t == "搜索" || t.equals("Search", true) || d == "搜索" ||
+                d.startsWith("搜索") || t.startsWith("搜索")
+            if (isSearchEntry) {
                 var cur: AccessibilityNodeInfo? = node
                 var hops = 0
                 while (cur != null && hops < 4) {
@@ -575,9 +784,108 @@ class GameAccessibilityService : AccessibilityService() {
             }
             for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
         }
-        val target = cands.minByOrNull { it.top } ?: return false
-        return target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK).also {
-            Log.i("GameMaster", "[search] 点击顶部搜索入口 top=${target.top} ok=$it")
+        return cands.minByOrNull { it.top }?.node
+    }
+
+    private fun tapTopSearchEntry(root: AccessibilityNodeInfo): Boolean {
+        val target = findTopSearchEntryNode(root) ?: return false
+        return target.performAction(AccessibilityNodeInfo.ACTION_CLICK).also {
+            val r = Rect(); target.getBoundsInScreen(r)
+            Log.i("GameMaster", "[search] 点击顶部搜索入口 top=${r.top} ok=$it")
+        }
+    }
+
+    /** 按 content-desc 精确匹配点击节点（用于点"下载管理/待安装"等按钮） */
+    suspend fun tapNodeByDesc(desc: String): Boolean = withContext(Dispatchers.Main) {
+        val root = activeAppRoot() ?: return@withContext false
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        while (q.isNotEmpty() && n < 500) {
+            val node = q.removeFirst()
+            n++
+            if (node.contentDescription?.toString()?.trim() == desc) {
+                if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return@withContext true
+                var cur: AccessibilityNodeInfo? = node
+                var hops = 0
+                while (cur != null && hops < 5) {
+                    if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return@withContext true
+                    cur = cur.parent
+                    hops++
+                }
+                return@withContext false
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        false
+    }
+
+    /** 按 text 精确匹配点击节点（用于点"首页"等 tab） */
+    suspend fun tapNodeByText(text: String): Boolean = withContext(Dispatchers.Main) {
+        val root = activeAppRoot() ?: return@withContext false
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        while (q.isNotEmpty() && n < 500) {
+            val node = q.removeFirst()
+            n++
+            if (node.text?.toString()?.trim() == text) {
+                if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return@withContext true
+                var cur: AccessibilityNodeInfo? = node
+                var hops = 0
+                while (cur != null && hops < 5) {
+                    if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return@withContext true
+                    cur = cur.parent
+                    hops++
+                }
+                return@withContext false
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        false
+    }
+
+    /** 检查应用是否已安装 */
+    fun isPackageInstalled(packageName: String): Boolean {
+        return try {
+            packageManager.getPackageInfo(packageName, 0)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 直接用 pm install 安装应用宝已下载的 APK（绕过应用宝 UI 的反自动化机制）。
+     * 在应用宝下载目录查找文件名包含目标包名的 APK，用 su 执行安装。
+     */
+    suspend fun installDownloadedApk(packageName: String): Boolean = withContext(Dispatchers.IO) {
+        val dir = "/sdcard/Android/data/com.tencent.android.qqdownloader/files/tassistant/apk"
+        try {
+            // 用 su 列出目录（普通应用无权限读 Android/data）
+            // 此设备 su 语法为 su 0 command（不支持 -c）
+            val lsProc = Runtime.getRuntime().exec(arrayOf("su", "0", "sh", "-c", "ls $dir/*.apk 2>/dev/null"))
+            val files = lsProc.inputStream.bufferedReader().readLines()
+            lsProc.waitFor()
+            val apk = files.firstOrNull { it.contains(packageName) }
+            if (apk == null) {
+                Log.i("GameMaster", "[download] 未找到 $packageName 的 APK，files=${files.size} list=${files.take(3)}")
+                return@withContext false
+            }
+            Log.i("GameMaster", "[download] 找到 APK: $apk")
+            // 用 su 执行 pm install -r
+            val proc = Runtime.getRuntime().exec(arrayOf("su", "0", "pm", "install", "-r", apk))
+            val output = proc.inputStream.bufferedReader().readText()
+            val exit = proc.waitFor()
+            Log.i("GameMaster", "[download] pm install exit=$exit output=$output")
+            if (exit == 0 && output.contains("Success")) {
+                delay(2000)
+                return@withContext true
+            }
+            return@withContext false
+        } catch (e: Exception) {
+            Log.e("GameMaster", "[download] installDownloadedApk 异常: ${e.message}")
+            false
         }
     }
 
@@ -586,6 +894,74 @@ class GameAccessibilityService : AccessibilityService() {
      * 仅在系统/LBE 窗口内、且弹窗文案确实与"打开/启动应用"有关时，
      * 精确点击"允许/始终允许/允许本次使用"等白名单按钮，绝不碰"取消/拒绝"。
      */
+    /**
+     * 应用宝首启/冷启动时常弹出"热门应用一键下载（本页全选）"全屏遮罩，挡住首页搜索框，
+     * 模型会把列表项误当搜索结果乱点。识别后点右上角 X，找不到 X 就按返回。
+     */
+    fun dismissBulkDownloadSheet(): Boolean {
+        val root = try { activeAppRoot() } catch (_: Exception) { null } ?: return false
+        val texts = mutableListOf<String>()
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        while (q.isNotEmpty() && n < 400) {
+            val node = q.removeFirst(); n++
+            node.text?.let { texts.add(it.toString()) }
+            node.contentDescription?.let { texts.add(it.toString()) }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        val joined = texts.joinToString(" ")
+        if (!joined.contains("一键下载") || !joined.contains("本页全选")) return false
+
+        // 优先点右上角关闭小按钮
+        val rr = Rect(); root.getBoundsInScreen(rr)
+        q.clear(); q.add(root); n = 0
+        while (q.isNotEmpty() && n < 400) {
+            val node = q.removeFirst(); n++
+            if (node.isClickable) {
+                val r = Rect(); node.getBoundsInScreen(r)
+                if (r.top in 120..380 && r.width() in 40..120 && r.height() in 40..120 &&
+                    r.left >= rr.width() - 200
+                ) {
+                    if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        Log.i("GameMaster", "[popup] 已关闭一键下载遮罩（右上角 X）")
+                        return true
+                    }
+                }
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        val back = performGlobalAction(GLOBAL_ACTION_BACK)
+        Log.i("GameMaster", "[popup] 一键下载遮罩未找到 X，按返回 ok=$back")
+        return back
+    }
+
+    /**
+     * 登录墙识别：目标 App 要求登录（密码输入框/验证码登录等），继续点哪里都没用。
+     * 命中条件：存在密码输入框；或同时出现"登录/验证码/密码"等两个以上强信号文案。
+     */
+    fun isLoginWall(): Boolean {
+        val root = try { activeAppRoot() } catch (_: Exception) { null } ?: return false
+        var hasPasswordField = false
+        var signal = 0
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        while (q.isNotEmpty() && n < 400) {
+            val node = q.removeFirst(); n++
+            if (node.isPassword) hasPasswordField = true
+            val t = (node.text?.toString().orEmpty() + " " + node.contentDescription?.toString().orEmpty())
+            when {
+                t.contains("短信验证码登录") || t.contains("验证码登录") ||
+                    t.contains("密码登录") || t.contains("请输入密码") ||
+                    t.contains("找回密码") || t.contains("登录密码") -> signal++
+                t.trim() == "登录" || t.contains("请先登录") || t.contains("未登录") -> signal++
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        return hasPasswordField || signal >= 2
+    }
+
     fun dismissLaunchConfirmDialog(): Boolean {
         val sysPkgs = setOf(
             "android", "com.lbe.security.miui",
@@ -714,21 +1090,132 @@ class GameAccessibilityService : AccessibilityService() {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
         field.refresh()
-        if (field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+        val setOk = field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        Log.i("GameMaster", "[input] ACTION_SET_TEXT setOk=$setOk")
+        if (setOk) {
+            // 等待文字刷新
             field.refresh()
-            if (textAccepted(field.text?.toString(), text)) return true
+            return true
         }
+        // 兜底：剪贴板粘贴（Android 10+ 可能因非焦点应用失败）
         val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
         cm.setPrimaryClip(android.content.ClipData.newPlainText("input", text))
-        // 先清空再粘贴，避免自绘输入框把粘贴内容追加到已有文字后面
         field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
         })
         val pasted = field.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-        field.refresh()
-        val ok = pasted && textAccepted(field.text?.toString(), text)
-        if (!ok) Log.w("GameMaster", "[input] 写入「$text」失败（SET_TEXT/粘贴均未生效，当前值=${field.text}）")
-        return ok
+        Log.i("GameMaster", "[input] ACTION_PASTE pasted=$pasted")
+        return pasted
+    }
+
+    /**
+     * 检查当前应用页面所有无障碍节点的文本/描述中是否包含指定文字。
+     * 用于下载任务：进入详情页后核对标题是否就是目标应用，没出现说明点错了条目。
+     */
+    suspend fun pageContainsText(text: String): Boolean = withContext(Dispatchers.Main) {
+        if (text.isBlank()) return@withContext false
+        val root = activeAppRoot() ?: return@withContext false
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        while (q.isNotEmpty() && n < 600) {
+            val node = q.removeFirst()
+            n++
+            val t = node.text?.toString().orEmpty()
+            val d = node.contentDescription?.toString().orEmpty()
+            if (t.contains(text) || d.contains(text)) return@withContext true
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        false
+    }
+
+    /**
+     * 统计页面中文字精确匹配 text 的节点数量（用于区分详情页/列表页：
+     * 应用宝详情页只有 1 个"下载"按钮，首页/结果页有多个）。
+     */
+    suspend fun countTextExact(text: String): Int = withContext(Dispatchers.Main) {
+        if (text.isBlank()) return@withContext 0
+        val root = activeAppRoot() ?: return@withContext 0
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        var count = 0
+        while (q.isNotEmpty() && n < 600) {
+            val node = q.removeFirst()
+            n++
+            val t = node.text?.toString()?.trim().orEmpty()
+            val d = node.contentDescription?.toString()?.trim().orEmpty()
+            if (t == text || d == text) count++
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        count
+    }
+
+    /**
+     * 只检查屏幕顶部区域（应用标题通常在 top<520px）是否包含指定文字。
+     * 比 pageContainsText 更严格——避免详情页底部"相关推荐"里出现目标应用名时误判为已进对详情页。
+     */
+    suspend fun pageTopContainsText(text: String): Boolean = withContext(Dispatchers.Main) {
+        if (text.isBlank()) return@withContext false
+        val root = activeAppRoot() ?: return@withContext false
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        val r = Rect()
+        while (q.isNotEmpty() && n < 600) {
+            val node = q.removeFirst()
+            n++
+            node.getBoundsInScreen(r)
+            if (r.top in 0..560) {
+                val t = node.text?.toString().orEmpty()
+                val d = node.contentDescription?.toString().orEmpty()
+                if (t.contains(text) || d.contains(text)) return@withContext true
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        false
+    }
+
+    /**
+     * 在搜索结果列表区域（minTop 以下，避开顶部搜索框）找到文字精确匹配的应用条目并点击。
+     * 用于下载任务：搜索出目标应用后，系统直接点进正确的详情页，避免弱模型点错广告位。
+     * @return true=找到并点击
+     */
+    suspend fun tapResultItemByName(name: String, minTop: Int = 180): Boolean = withContext(Dispatchers.Main) {
+        if (name.isBlank()) return@withContext false
+        val root = activeAppRoot() ?: return@withContext false
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var n = 0
+        val r = Rect()
+        while (q.isNotEmpty() && n < 600) {
+            val node = q.removeFirst()
+            n++
+            val t = node.text?.toString().orEmpty().trim()
+            val d = node.contentDescription?.toString().orEmpty().trim()
+            // 精确匹配应用名，避免点到"小红书千帆"等关联应用
+            if (t == name || d == name) {
+                node.getBoundsInScreen(r)
+                if (r.top >= minTop && r.width() > 5 && r.height() > 5) {
+                    // 沿父链找可点击节点
+                    var clicked = false
+                    var cur: AccessibilityNodeInfo? = node
+                    var hops = 0
+                    while (cur != null && hops < 6) {
+                        if (cur.isClickable && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                            clicked = true; break
+                        }
+                        cur = cur.parent
+                        hops++
+                    }
+                    if (!clicked) clicked = tap(r.exactCenterX(), r.exactCenterY())
+                    Log.i("GameMaster", "[download] 点击搜索结果条目「$name」 center=(${r.centerX()},${r.centerY()}) ok=$clicked")
+                    return@withContext clicked
+                }
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
+        }
+        false
     }
 
     /**
@@ -786,6 +1273,82 @@ class GameAccessibilityService : AccessibilityService() {
             }
         }
         return false
+    }
+
+    /**
+     * 系统 ANR / 应用错误恢复框（本定制 ROM 文案为"比较累,休息一下~ / 恢复运行"，
+     * 标准节点 id=android:id/aerr_close）。它属于 system_server 的包名 "android"，
+     * 与应用自身弹窗严格区分。找到按钮节点时返回，否则返回 null。
+     */
+    suspend fun findSystemErrorButton(): AccessibilityNodeInfo? = withContext(Dispatchers.Main) {
+        val roots = ArrayList<AccessibilityNodeInfo?>()
+        // 实测本 ROM 的 ANR 框是 active window，必须包含 activeAppRoot；
+        // 某些机型上 active root 又是被冻住的应用，故再补 rootInActiveWindow 与全部窗口
+        activeAppRoot()?.let { roots.add(it) }
+        rootInActiveWindow?.let { roots.add(it) }
+        try {
+            for (w in windows) w.root?.let { roots.add(it) }
+        } catch (e: Exception) {
+            // 部分 ROM 取 windows 需要额外权限，忽略即可
+        }
+        for (root in roots) {
+            root ?: continue
+            val rootPkg = root.packageName?.toString().orEmpty()
+            // 该框由 system_server 渲染，包名为 android；个别 ROM 上报空包名，靠文本兜底
+            if (rootPkg.isNotEmpty() && rootPkg != "android") continue
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            var visited = 0
+            var hasAnrText = false
+            var textButton: AccessibilityNodeInfo? = null
+            while (queue.isNotEmpty() && visited < 300) {
+                val node = queue.removeFirst()
+                visited++
+                val id = node.viewIdResourceName ?: ""
+                val t = node.text?.toString().orEmpty()
+                if (t.contains("无响应") || t.contains("休息一下") || t.contains("ANR")) {
+                    hasAnrText = true
+                }
+                // aerr_close/aerr_restart 是系统 ANR/崩溃框专用 id，见到即可直接点
+                if (id == "android:id/aerr_close" || id == "android:id/aerr_restart") {
+                    return@withContext node
+                }
+                // 部分 ROM 不向无障碍暴露 viewId（实测本机如此），用按钮文本兜底
+                if ((t == "恢复运行" || t == "关闭应用" || t == "等待" || t == "确定") &&
+                    (node.isClickable || node.parent?.isClickable == true)
+                ) {
+                    textButton = node
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { queue.add(it) }
+                }
+            }
+            // 文本按钮必须与"休息一下/无响应"标题同框，避免误点应用自己的同名按钮
+            if (hasAnrText && textButton != null) return@withContext textButton
+        }
+        null
+    }
+
+    /** 点掉系统 ANR 框（aerr_close 会重启卡死的应用进程）。true=已触发恢复。 */
+    suspend fun dismissSystemErrorDialog(): Boolean {
+        val node = findSystemErrorButton() ?: return false
+        return withContext(Dispatchers.Main) {
+            val r = Rect()
+            node.refresh()
+            node.getBoundsInScreen(r)
+            var clicked = false
+            if (node.isClickable) {
+                clicked = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            }
+            if (!clicked && r.width() > 5 && r.height() > 5) {
+                clicked = tap(r.exactCenterX(), r.exactCenterY())
+            }
+            Log.i(
+                "GameMaster",
+                "[anr] 检测到系统 ANR/错误框，已点「恢复运行」节点 click=$clicked center=(${r.exactCenterX().toInt()}, ${r.exactCenterY().toInt()})"
+            )
+            clicked
+        }
     }
 
     /**
@@ -897,6 +1460,12 @@ class GameAccessibilityService : AccessibilityService() {
         var exact: AccessibilityNodeInfo? = null       // bounds 完全相同
         var labeled: AccessibilityNodeInfo? = null     // 同标签且中心最近
         var labeledDist = Int.MAX_VALUE
+        // 列表轻微重排/轮播占位词变化（如"甲乙饼·现熬粥"→"甲乙饼粥店"）时的降级匹配：
+        var byId: AccessibilityNodeInfo? = null        // 同 viewId 且位置接近
+        var byIdDist = Int.MAX_VALUE
+        var fuzzy: AccessibilityNodeInfo? = null       // 文字互相包含且位置接近
+        var fuzzyDist = Int.MAX_VALUE
+        val wantLabel = el.text.ifBlank { el.desc }.trim()
         val q = ArrayDeque<AccessibilityNodeInfo>()
         q.add(root)
         var n = 0
@@ -908,18 +1477,37 @@ class GameAccessibilityService : AccessibilityService() {
             if (r.left == el.left && r.top == el.top && r.right == el.right && r.bottom == el.bottom) {
                 exact = node
             }
+            val dist = kotlin.math.abs(r.centerX() - el.centerX) +
+                kotlin.math.abs(r.centerY() - el.centerY)
             if (sameLabel(node)) {
-                val dist = kotlin.math.abs(r.centerX() - el.centerX) +
-                    kotlin.math.abs(r.centerY() - el.centerY)
                 if (dist < labeledDist) { labeledDist = dist; labeled = node }
+            }
+            // 降级①：同 viewId（收集时截断到 24 字符），中心距离 300px 以内
+            if (el.viewId.isNotBlank()) {
+                val nid = node.viewIdResourceName?.substringAfterLast('/').orEmpty().take(24)
+                if (nid == el.viewId && dist in 1..300 && dist < byIdDist) {
+                    byIdDist = dist; byId = node
+                }
+            }
+            // 降级②：文字互相包含（轮播词/状态词轻微变化），中心距离 300px 以内
+            if (fuzzy == null && wantLabel.length >= 2) {
+                val t = node.text?.toString().orEmpty().trim()
+                val d = node.contentDescription?.toString().orEmpty().trim()
+                val near = t.length >= 2 && (t.contains(wantLabel) || wantLabel.contains(t)) ||
+                    d.length >= 2 && (d.contains(wantLabel) || wantLabel.contains(d))
+                if (near && dist in 1..300 && dist < fuzzyDist) {
+                    fuzzyDist = dist; fuzzy = node
+                }
             }
             for (i in 0 until node.childCount) node.getChild(i)?.let { q.add(it) }
         }
 
-        val target = exact ?: labeled
+        val target = exact ?: labeled ?: byId ?: fuzzy
         if (target == null) {
-            // 界面已变化，找不到同一元素：不做任何猜测性点击
-            Log.w("GameMaster", "[smarttap] index=${el.index}「${el.text.ifBlank { el.desc }}」在当前界面已不存在，放弃点击")
+            // 节点重定位全部失败（页面已跳转/列表项移动/动画中）：
+            // 绝不退回"快照中心盲点击"——列表项滚动后旧坐标会点到完全无关的控件，
+            // 宁可放弃本次动作并让上层提示模型重新观察屏幕
+            Log.w("GameMaster", "[smarttap] index=${el.index}「${el.text.ifBlank { el.desc }}」重定位失败，放弃本次点击（不做盲点）")
             return@withContext null
         }
 
@@ -1123,6 +1711,49 @@ class GameAccessibilityService : AccessibilityService() {
             match?.activityInfo?.packageName
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /** 直接按包名启动应用（下载任务已知商店包名时用，绕过应用名匹配） */
+    suspend fun launchAppByPackage(pkg: String): Boolean = withContext(Dispatchers.IO) {
+        if (pkg.isBlank()) return@withContext false
+        try {
+            // 先杀后台进程。getLaunchIntentForPackage 常返回 SplashActivity，
+            // 在应用已在后台时启动后会立即退回桌面（如应用宝）。
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            try { am?.killBackgroundProcesses(pkg) } catch (_: Exception) { }
+            // 再用 shell am force-stop 兜底（killBackgroundProcesses 杀不掉前台服务）
+            try { Runtime.getRuntime().exec(arrayOf("sh", "-c", "am force-stop $pkg")).waitFor() } catch (_: Exception) { }
+            delay(600)
+
+            // 优先用名字含 "Main" 的 Activity 启动（比 SplashActivity 更稳），
+            // 找不到则回退到 getLaunchIntentForPackage。
+            var launchCls: String? = null
+            try {
+                val info = packageManager.getPackageInfo(pkg, android.content.pm.PackageManager.GET_ACTIVITIES)
+                launchCls = info.activities
+                    ?.filter { it.exported }
+                    ?.map { it.name }
+                    ?.firstOrNull { it.contains("Main", ignoreCase = true) }
+            } catch (_: Exception) { }
+            if (launchCls == null) {
+                launchCls = packageManager.getLaunchIntentForPackage(pkg)?.component?.className
+            }
+            if (launchCls != null) {
+                val intent = Intent().apply {
+                    setClassName(pkg, launchCls)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                }
+                startActivity(intent)
+                Log.i("GameMaster", "[open_app] startActivity → $pkg/$launchCls")
+                true
+            } else {
+                Log.w("GameMaster", "[open_app] 未找到启动 Activity: $pkg")
+                false
+            }
+        } catch (e: Exception) {
+            Log.w("GameMaster", "[open_app] 启动 '$pkg' 失败：${e.message}")
+            false
         }
     }
 

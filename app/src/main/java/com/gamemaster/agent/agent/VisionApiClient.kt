@@ -170,25 +170,25 @@ class VisionApiClient(
     }
 
     /**
-     * 最后一步的"目标证据"系统复核：用一次极简视觉调用判断最终可见标志是否已出现。
-     * 用于弱模型自己看不出 128 方块、迟迟不 finish 的兜底；任何异常都按"未确认"处理。
+     * 失败终局检测：判断画面是否已进入"游戏结束/失败且无法继续操作"的状态
+     * （如 2048 的 Game Over）。只回答 YES/NO，任何异常按 NO 处理。
      */
-    fun verifyGoalEvidence(imageBase64: String, evidence: String): Boolean {
+    fun verifyDeadEnd(imageBase64: String): Boolean {
         if (imageBase64.isBlank()) return false
         return try {
             val messages = JSONArray()
             messages.put(
                 JSONObject()
                     .put("role", "system")
-                    .put("content", "你是严格的屏幕目标核验器，只根据截图判断，绝不猜测。只允许回答 YES 或 NO，不要输出任何其他内容。")
+                    .put("content", "你是严格的屏幕状态核验器，只根据截图判断，绝不猜测。只允许回答 YES 或 NO，不要输出任何其他内容。")
             )
             val content = JSONArray()
             content.put(
                 JSONObject().put("type", "text").put(
                     "text",
-                    "请判断下面这个“任务完成的可见标志”此刻是否已经真实、完整地出现在屏幕画面中：$evidence\n" +
-                        "要求：必须在真正的内容区域里看到（例如游戏棋盘内的数字方块），应用标题、按钮文字、装饰性图案不算。" +
-                        "确实已经出现才回答 YES，否则回答 NO。"
+                    "请判断屏幕上的游戏是否已经进入“结束/失败终局、无法再通过普通操作继续”的状态：" +
+                        "例如画面中央或棋盘上覆盖显示 Game Over、游戏结束、失败、再来一局、重新开始 等字样或弹窗。" +
+                        "仅仅是暂停、菜单、正常游戏进行中都不算。确实是失败终局才回答 YES，否则回答 NO。"
                 )
             )
             content.put(
@@ -203,7 +203,73 @@ class VisionApiClient(
                 .put("model", model)
                 .put("messages", messages)
                 .put("temperature", 0)
-                .put("max_tokens", 20)
+                .put("max_tokens", 40)
+
+            val endpoint = "${baseUrl.trimEnd('/')}/chat/completions"
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 20_000
+                readTimeout = 40_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Authorization", "Bearer $apiKey")
+            }
+            try {
+                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val body = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+                if (code !in 200..299) return false
+                val resp = JSONObject(body)
+                var text = resp.optJSONArray("choices")?.optJSONObject(0)
+                    ?.optJSONObject("message")?.optString("content", "").orEmpty()
+                text = text.replace(Regex("(?s)<think>.*"), "").trim()
+                Log.i("GameMaster", "[verify] 失败终局核验回复=${text.take(40)}")
+                val t = text.uppercase()
+                t.contains("YES") || (text.contains("是") && !text.contains("否") && text.length <= 10)
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 最后一步的"目标证据"系统复核：用一次极简视觉调用判断最终可见标志是否已出现。
+     * 用于弱模型自己看不出 128 方块、迟迟不 finish 的兜底；任何异常都按"未确认"处理。
+     */
+    fun verifyGoalEvidence(imageBase64: String, evidence: String): Boolean {
+        if (imageBase64.isBlank()) return false
+        return try {
+            val messages = JSONArray()
+            messages.put(
+                JSONObject()
+                    .put("role", "system")
+                    .put("content", "你是屏幕核验器，只根据截图回答，不要猜测。先在画面里找，找到了回答 YES，找不到回答 NO。")
+            )
+            val content = JSONArray()
+            content.put(
+                JSONObject().put("type", "text").put(
+                    "text",
+                    "看这张截图，画面中是否直接看得到：$evidence？\n" +
+                        "（以画面里真实存在的内容为准，例如游戏棋盘格子里的数字方块；标题或按钮上的同名文字不算。）\n" +
+                        "看得到就回答 YES，看不到回答 NO。"
+                )
+            )
+            content.put(
+                JSONObject().put("type", "image_url").put(
+                    "image_url",
+                    JSONObject().put("url", "data:image/jpeg;base64,$imageBase64")
+                )
+            )
+            messages.put(JSONObject().put("role", "user").put("content", content))
+
+            val payload = JSONObject()
+                .put("model", model)
+                .put("messages", messages)
+                .put("temperature", 0)
+                .put("max_tokens", 40)
 
             val endpoint = "${baseUrl.trimEnd('/')}/chat/completions"
             val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
@@ -282,27 +348,105 @@ class VisionApiClient(
                 throw RuntimeException("HTTP $code：${body.take(200)}")
             }
             val resp = JSONObject(body)
-            var content = resp.getJSONArray("choices").getJSONObject(0)
+            val content = resp.getJSONArray("choices").getJSONObject(0)
                 .optJSONObject("message")?.optString("content", "").orEmpty()
-            content = content
-                .replace(Regex("(?s)<think>.*?</think>"), "")
-                .replace(Regex("(?s)<think>.*"), "")
-                .replace(Regex("```(?:json)?", RegexOption.IGNORE_CASE), "")
-                .trim()
-            // 只截取第一个完整 JSON 对象
-            val start = content.indexOf('{')
-            val end = content.lastIndexOf('}')
-            if (start < 0 || end <= start) return null
-            val obj = JSONObject(content.substring(start, end + 1))
-            val goal = obj.optString("goal", "").trim()
-            val targetApp = obj.optString("target_app", obj.optString("app", "")).trim()
-            val arr = obj.optJSONArray("steps") ?: return null
-            val steps = (0 until arr.length()).map { arr.optString(it).trim() }.filter { it.isNotBlank() }
-            if (steps.size < 2) return null
-            Log.i("GameMaster", "[plan] 目标=$goal 应用=$targetApp 步骤=${steps.size}：${steps.joinToString(" / ")}")
-            return TaskPlan(targetApp, goal, steps)
+            return parsePlanContent(content)
         } finally {
             conn.disconnect()
+        }
+    }
+
+    /** 从模型回复文本中解析 TaskPlan（首规划与画面重规划共用） */
+    private fun parsePlanContent(raw: String): TaskPlan? {
+        var content = raw
+            .replace(Regex("(?s)<think>.*?</think>"), "")
+            .replace(Regex("(?s)<think>.*"), "")
+            .replace(Regex("```(?:json)?", RegexOption.IGNORE_CASE), "")
+            .trim()
+        // 只截取第一个完整 JSON 对象
+        val start = content.indexOf('{')
+        val end = content.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        val obj = JSONObject(content.substring(start, end + 1))
+        val goal = obj.optString("goal", "").trim()
+        val targetApp = obj.optString("target_app", obj.optString("app", "")).trim()
+        val arr = obj.optJSONArray("steps") ?: return null
+        val steps = (0 until arr.length()).map { arr.optString(it).trim() }.filter { it.isNotBlank() }
+        if (steps.size < 2) return null
+        Log.i("GameMaster", "[plan] 目标=$goal 应用=$targetApp 步骤=${steps.size}：${steps.joinToString(" / ")}")
+        return TaskPlan(targetApp, goal, steps)
+    }
+
+    /**
+     * 执行期"重新规划"（带当前屏幕截图）：原计划走不通/反复在同一界面打转时，
+     * 把"用户原始任务 + 当前画面 + 卡住原因"交给视觉模型，从当前真实界面重新拆解步骤。
+     * 解析失败返回 null，调用方保留旧计划继续。
+     */
+    fun replanFromScreen(
+        task: String,
+        imageBase64: String,
+        currentAppHint: String,
+        stuckReason: String
+    ): TaskPlan? {
+        if (imageBase64.isBlank()) return null
+        return try {
+            val msgs = JSONArray()
+            msgs.put(JSONObject().put("role", "system").put("content", PLANNER_PROMPT))
+            val content = JSONArray()
+            content.put(
+                JSONObject().put("type", "text").put(
+                    "text",
+                    "助手之前按一版计划执行「$task」，但在当前界面卡住、反复操作没有进展。\n" +
+                        "卡住原因：$stuckReason\n" +
+                        (if (currentAppHint.isNotBlank()) "当前前台应用：$currentAppHint\n" else "") +
+                        "请只根据这张截图里的真实界面重新拆解任务：先判断现在处在什么页面、离目标还差什么，" +
+                        "给出从【当前画面】继续推进的新计划（目标不变，步骤可以和之前完全不同，要务实、可在当前界面执行）。" +
+                        "仍按规定 JSON 格式输出，不要输出 JSON 以外内容。"
+                )
+            )
+            content.put(
+                JSONObject().put("type", "image_url").put(
+                    "image_url",
+                    JSONObject().put("url", "data:image/jpeg;base64,$imageBase64")
+                )
+            )
+            msgs.put(JSONObject().put("role", "user").put("content", content))
+
+            val payload = JSONObject()
+                .put("model", model)
+                .put("messages", msgs)
+                .put("temperature", 0.2)
+                .put("max_tokens", 900)
+
+            val endpoint = "${baseUrl.trimEnd('/')}/chat/completions"
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 30_000
+                readTimeout = 60_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Authorization", "Bearer $apiKey")
+            }
+            try {
+                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val body = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+                if (code !in 200..299 || body.isBlank()) {
+                    Log.w("GameMaster", "[replan] HTTP $code：${body.take(150)}")
+                    return null
+                }
+                val resp = JSONObject(body)
+                val respContent = resp.getJSONArray("choices").getJSONObject(0)
+                    .optJSONObject("message")?.optString("content", "").orEmpty()
+                Log.i("GameMaster", "[replan] 已基于当前画面重新规划")
+                parsePlanContent(respContent)
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.w("GameMaster", "[replan] 画面重规划异常：${e.message?.take(120)}")
+            null
         }
     }
 
