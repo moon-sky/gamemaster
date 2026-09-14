@@ -54,7 +54,7 @@ A vision-model-driven Android automation assistant. Describe your task in one se
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/your-org/gamemaster.git
+git clone https://github.com/moon-sky/gamemaster.git
 cd gamemaster
 
 # 2. 本地配置 SDK 路径（编辑 local.properties）
