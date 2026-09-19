@@ -62,6 +62,24 @@
             android:layout_marginTop="8dp"
             android:text="@string/btn_projection" />
 
+        <Button
+            android:id="@+id/btnShizuku"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="连接 Shizuku（非 Root 设备可选）" />
+
+        <TextView
+            android:id="@+id/tvBackendStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:background="@drawable/bg_card"
+            android:padding="12dp"
+            android:text="当前后端：未知"
+            android:textSize="13sp" />
+
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"

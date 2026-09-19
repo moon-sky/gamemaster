@@ -3,6 +3,7 @@ package com.gamemaster.agent.agent
 import android.graphics.Bitmap
 import android.util.Base64
 import com.gamemaster.agent.service.GameAccessibilityService
+import com.gamemaster.agent.tools.ToolRegistry
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import java.io.ByteArrayOutputStream
@@ -915,8 +916,10 @@ class GameAgent(
             )
             // 预防：本机定制 ROM 的 audioserver 偶发卡死，2048 首次移动播声音时
             // SoundPool 会阻塞主线程直接 ANR。任务开始前先重启一次音频服务（init 自动拉起）
-            if (com.gamemaster.agent.screenshot.RootUtil.isRooted()) {
-                com.gamemaster.agent.screenshot.RootUtil.exec("killall -9 audioserver 2>/dev/null; true")
+            // 走 BackendSelector：有 Root 用 Root，没 Root 但有 Shizuku 也能跑
+            val shellBackend = com.gamemaster.agent.backend.BackendSelector.bestForShell()
+            if (shellBackend != null) {
+                shellBackend.exec("killall -9 audioserver 2>/dev/null; true")
                 delay(800)
             }
         }
@@ -1142,11 +1145,9 @@ class GameAgent(
                 }
                 service.postStatus("检测到应用无响应(ANR)，正在重启音频服务并恢复应用…（$anrRounds/5）")
                 android.util.Log.i("GameMaster", "[anr] 第 $anrRounds 次检测到系统 ANR 框，重启 audioserver 后点恢复")
-                if (com.gamemaster.agent.screenshot.RootUtil.isRooted()) {
-                    com.gamemaster.agent.screenshot.RootUtil.exec(
-                        "killall -9 audioserver 2>/dev/null; killall -9 mediaserver 2>/dev/null; true"
-                    )
-                }
+                com.gamemaster.agent.backend.BackendSelector.bestForShell()?.exec(
+                    "killall -9 audioserver 2>/dev/null; killall -9 mediaserver 2>/dev/null; true"
+                )
                 delay(1500)
                 service.dismissSystemErrorDialog()
                 delay(4500)
@@ -2230,6 +2231,43 @@ class GameAgent(
                     }
                     ok
                 }
+            }
+
+            AgentAction.Type.TOOL_CALL -> {
+                // 模型主动调用注册的 Python 工具（web_search / web_read / apk_install / file_ops 等）。
+                // 直接路由到 ToolRegistry；把返回的输出/错误回灌给模型，下一轮它就能基于结果继续推理。
+                val result = ToolRegistry.call(action.toolName, action.toolArgs)
+                if (result.ok) {
+                    // 工具调用步骤的验证标志就是"系统返回工具输出"，结果到手即本步完成，
+                    // 自动推进 currentStep，避免弱模型反复输出同一个 tool_call 卡死在第 1 步。
+                    val pl = plan
+                    if (pl != null && currentStep < pl.steps.size) {
+                        currentStep++
+                        if (currentStep != lastAnnouncedStep) {
+                            lastAnnouncedStep = currentStep
+                            service.postStatus("计划 $currentStep/${pl.steps.size}：${pl.steps.getOrNull(currentStep - 1).orEmpty().take(40)}")
+                        }
+                    }
+                    history.addLast(
+                        "系统：工具 ${action.toolName} 执行成功，输出：\n${result.output.take(1500)}\n" +
+                        "【注意】当前计划步骤已完成，已自动推进到第 $currentStep 步。" +
+                        "如果工具结果已能直接回答用户问题，直接输出 finish 结束任务；否则按计划继续下一步。"
+                    )
+                    android.util.Log.i(
+                        "GameMaster",
+                        "[tool] ${action.toolName}(${action.toolArgs}) ok → ${result.output.take(200)}"
+                    )
+                } else {
+                    history.addLast(
+                        "系统：工具 ${action.toolName} 执行失败——${result.error ?: "未知错误"}。" +
+                        "请换一个工具或改用屏幕操作完成当前步骤。"
+                    )
+                    android.util.Log.w(
+                        "GameMaster",
+                        "[tool] ${action.toolName}(${action.toolArgs}) failed → ${result.error?.take(200)}"
+                    )
+                }
+                result.ok
             }
 
             else -> true

@@ -24,12 +24,17 @@ data class AgentAction(
     val elementIndex: Int = -1,
     /** open_app 动作的目标应用名（如"抖音"）或包名 */
     val appName: String = "",
+    /** TOOL_CALL 动作的工具名（对应 ToolRegistry 中注册的 spec.name） */
+    val toolName: String = "",
+    /** TOOL_CALL 动作的参数（来自 JSON args 对象，全部按字符串处理；工具 handler 内自行转换类型） */
+    val toolArgs: Map<String, String> = emptyMap(),
     /** 模型自报的当前计划步骤编号（从 1 开始）；0 表示模型未提供 */
     val planStep: Int = 0
 ) {
     enum class Type {
         TAP, DOUBLE_TAP, LONG_PRESS, SWIPE,
         WAIT, BACK, HOME, INPUT, OPEN_APP, SEARCH,
+        TOOL_CALL,
         FINISH, UNKNOWN
     }
 
@@ -45,6 +50,7 @@ data class AgentAction(
         Type.INPUT -> "输入文字：$text"
         Type.OPEN_APP -> "打开应用：$appName"
         Type.SEARCH -> "搜索：$text"
+        Type.TOOL_CALL -> "调用工具 $toolName(${toolArgs.entries.joinToString(", ") { "${it.key}=${it.value}" }})"
         Type.FINISH -> "任务结束"
         Type.UNKNOWN -> "无法解析动作"
     }
@@ -272,6 +278,29 @@ data class AgentAction(
                 "search", "submit", "search_text", "query" ->
                     if (inputText.isNotBlank()) AgentAction(thought, Type.SEARCH, text = inputText)
                     else AgentAction(thought, Type.UNKNOWN)
+
+                "tool_call", "call_tool", "tool", "invoke" -> {
+                    // 期望格式：{"action":"tool_call","tool_name":"web_search","args":{"query":"..."}}
+                    val tName = obj.optString("tool_name", obj.optString("tool", "")).trim()
+                    val tArgs = mutableMapOf<String, String>()
+                    obj.optJSONObject("args")?.let { argsObj ->
+                        for (k in argsObj.keys()) {
+                            tArgs[k] = argsObj.optString(k, "")
+                        }
+                    }
+                    // 没写 args 对象时，把除 thought/action/tool_name 外的标量字段当参数兜底
+                    if (tArgs.isEmpty()) {
+                        val known = setOf("thought", "action", "type", "tool_name", "tool", "plan_step", "current_step", "step_no", "step")
+                        for (k in obj.keys()) {
+                            if (k !in known) tArgs[k] = obj.optString(k, "")
+                        }
+                    }
+                    if (tName.isNotBlank()) {
+                        AgentAction(thought, Type.TOOL_CALL, toolName = tName, toolArgs = tArgs)
+                    } else {
+                        AgentAction(thought, Type.UNKNOWN)
+                    }
+                }
 
                 "finish", "done", "complete", "task_complete", "finished", "end", "stop" ->
                     AgentAction(thought, Type.FINISH)

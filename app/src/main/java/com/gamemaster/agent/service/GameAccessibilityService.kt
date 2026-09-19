@@ -19,7 +19,8 @@ import com.gamemaster.agent.MainActivity
 import com.gamemaster.agent.agent.AgentConfig
 import com.gamemaster.agent.agent.GameAgent
 import com.gamemaster.agent.prefs.Prefs
-import com.gamemaster.agent.screenshot.RootUtil
+import com.gamemaster.agent.backend.BackendSelector
+import com.gamemaster.agent.backend.DeviceBackend
 import com.gamemaster.agent.screenshot.ScreenshotManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -84,6 +85,14 @@ class GameAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        // 注册无障碍后端到 BackendSelector（成为兜底后端）
+        com.gamemaster.agent.backend.BackendSelector.setAccessibilityService(this)
+        // 注册内置 Python 工具到 ToolRegistry（Chaquopy 已由 Application 启动）
+        try {
+            com.gamemaster.agent.tools.BuiltInTools.registerAll(this)
+        } catch (e: Exception) {
+            android.util.Log.w("GameMaster", "[tools] BuiltInTools 注册失败：${e.message}")
+        }
         postStatus("无障碍服务已连接")
         // 进程曾被系统强杀时自动恢复任务（shouldRun 标记在 startAgent 时置位）
         if (Prefs.agentShouldRun(this) && !isAgentRunning()) {
@@ -282,8 +291,9 @@ class GameAccessibilityService : AccessibilityService() {
                 delay(300)
                 bmp = ScreenshotManager.capture()
             }
-            if (bmp == null && RootUtil.isRooted()) {
-                bmp = RootUtil.screenshot()
+            if (bmp == null) {
+                // 已 root / Shizuku 设备兜底用 shell 截屏
+                bmp = BackendSelector.bestForShell()?.screenshot()
             }
             bmp
         }
@@ -389,21 +399,24 @@ class GameAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 手势注入：已 root 设备优先用 `su 0 input ...`（部分定制 ROM 上
+     * 手势注入：已 root / Shizuku 设备优先用 shell `input ...`（部分定制 ROM 上
      * AccessibilityService.dispatchGesture 对游戏无效），失败再回退无障碍手势。
      */
-    private suspend fun viaRootOrGesture(blockRoot: () -> Boolean, blockGesture: suspend () -> Boolean): Boolean =
-        withContext(Dispatchers.IO) {
-            if (RootUtil.isRooted()) {
-                val ok = blockRoot()
-                if (ok) return@withContext true
-                Log.w("GameMaster", "root input 未成功，回退无障碍手势")
-            }
-            blockGesture()
+    private suspend fun viaBestBackend(
+        blockShell: (DeviceBackend) -> Boolean,
+        blockGesture: suspend () -> Boolean
+    ): Boolean = withContext(Dispatchers.IO) {
+        val backend = BackendSelector.bestForShell()
+        if (backend != null) {
+            val ok = blockShell(backend)
+            if (ok) return@withContext true
+            Log.w("GameMaster", "shell backend 未成功，回退无障碍手势")
         }
+        blockGesture()
+    }
 
-    suspend fun tap(x: Float, y: Float): Boolean = viaRootOrGesture(
-        blockRoot = { RootUtil.tap(x.roundToInt(), y.roundToInt()) },
+    suspend fun tap(x: Float, y: Float): Boolean = viaBestBackend(
+        blockShell = { it.tap(x.roundToInt(), y.roundToInt()) },
         blockGesture = {
             // 时长太短（<16ms）的手势在部分 App（如抖音）上会被忽略，用 40ms 更接近真人
             dispatch(GestureDescription.Builder().addStroke(strokeAt(x, y, 40L)).build())
@@ -411,8 +424,8 @@ class GameAccessibilityService : AccessibilityService() {
     )
 
     /** 双击 */
-    suspend fun doubleTap(x: Float, y: Float): Boolean = viaRootOrGesture(
-        blockRoot = { RootUtil.doubleTap(x.roundToInt(), y.roundToInt()) },
+    suspend fun doubleTap(x: Float, y: Float): Boolean = viaBestBackend(
+        blockShell = { it.doubleTap(x.roundToInt(), y.roundToInt()) },
         blockGesture = {
             val builder = GestureDescription.Builder()
                 .addStroke(strokeAt(x, y, 8L, 0L))
@@ -421,8 +434,8 @@ class GameAccessibilityService : AccessibilityService() {
         }
     )
 
-    suspend fun longPress(x: Float, y: Float, durationMs: Long): Boolean = viaRootOrGesture(
-        blockRoot = { RootUtil.longPress(x.roundToInt(), y.roundToInt(), durationMs.toInt()) },
+    suspend fun longPress(x: Float, y: Float, durationMs: Long): Boolean = viaBestBackend(
+        blockShell = { it.longPress(x.roundToInt(), y.roundToInt(), durationMs.toInt()) },
         blockGesture = {
             dispatch(GestureDescription.Builder().addStroke(strokeAt(x, y, durationMs)).build())
         }
@@ -434,9 +447,9 @@ class GameAccessibilityService : AccessibilityService() {
             lineTo(x2.coerceAtLeast(1f), y2.coerceAtLeast(1f))
         }
         val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs.coerceAtLeast(100L))
-        return viaRootOrGesture(
-            blockRoot = {
-                RootUtil.swipe(
+        return viaBestBackend(
+            blockShell = {
+                it.swipe(
                     x1.roundToInt(), y1.roundToInt(),
                     x2.roundToInt(), y2.roundToInt(),
                     durationMs.toInt()
@@ -450,14 +463,14 @@ class GameAccessibilityService : AccessibilityService() {
 
     fun globalBack() {
         // 无障碍全局返回优先：系统级 API，不留 input shell 痕迹（应用宝等反自动化
-        // 会检测 `input keyevent` 命令并直接退后台，导致"越救越卡"）；root keyevent 只作兜底
+        // 会检测 `input keyevent` 命令并直接退后台，导致"越救越卡"）；shell keyevent 只作兜底
         if (performGlobalAction(GLOBAL_ACTION_BACK)) return
-        if (RootUtil.isRooted()) RootUtil.keyEvent(4)
+        BackendSelector.bestForShell()?.keyEvent(4)
     }
 
     fun globalHome() {
         if (performGlobalAction(GLOBAL_ACTION_HOME)) return
-        if (RootUtil.isRooted()) RootUtil.keyEvent(3)
+        BackendSelector.bestForShell()?.keyEvent(3)
     }
 
     /** 在当前聚焦的输入框中设置文字（只填字，不自动发送） */
@@ -524,7 +537,7 @@ class GameAccessibilityService : AccessibilityService() {
                 val cx = er.left + er.width() / 2
                 val cy = er.top + er.height() / 2
                 Log.i("GameMaster", "[search] 搜索框 bounds=[$er] 中心=($cx,$cy)")
-                // 用 dispatchGesture 直接点击（绕过 RootUtil，避免 input tap 对自绘控件无效）
+                // 用 dispatchGesture 直接点击（绕过 shell input tap，避免对自绘控件无效）
                 val stroke = GestureDescription.StrokeDescription(
                     android.graphics.Path().apply { moveTo(cx.toFloat(), cy.toFloat()) },
                     0L, 80L
@@ -1651,9 +1664,10 @@ class GameAccessibilityService : AccessibilityService() {
                 Log.w("GameMaster", "[unstuck] 找不到 $pkg 的启动入口")
                 return false
             }
-            // root 设备直接 force-stop 更彻底；无 root 退化为杀后台进程
-            if (RootUtil.isRooted()) {
-                RootUtil.exec("am force-stop $pkg")
+            // 已 root / Shizuku 设备直接 force-stop 更彻底；都没有则退化为杀后台进程
+            val backend = BackendSelector.bestForShell()
+            if (backend != null) {
+                backend.exec("am force-stop $pkg")
             } else {
                 runCatching {
                     val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager

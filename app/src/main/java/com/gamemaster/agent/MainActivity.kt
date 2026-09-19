@@ -16,7 +16,6 @@ import androidx.core.content.ContextCompat
 import com.gamemaster.agent.BuildConfig
 import com.gamemaster.agent.databinding.ActivityMainBinding
 import com.gamemaster.agent.prefs.Prefs
-import com.gamemaster.agent.screenshot.RootUtil
 import com.gamemaster.agent.screenshot.ScreenshotManager
 import com.gamemaster.agent.service.GameAccessibilityService
 import com.gamemaster.agent.service.OverlayService
@@ -77,6 +76,21 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "配置已保存", Toast.LENGTH_SHORT).show()
         }
 
+        binding.btnShizuku.setOnClickListener {
+            // 用户主动连接 Shizuku：触发 binder 绑定与权限对话框
+            val ok = com.gamemaster.agent.backend.BackendSelector.bindShizuku(this)
+            if (ok) {
+                Toast.makeText(this, "Shizuku 已连接", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "请先安装 Shizuku 并启动服务，再点此按钮", Toast.LENGTH_LONG).show()
+                // 引导用户去 Shizuku 的官网 / Play 商店
+                runCatching {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/")))
+                }
+            }
+            refreshPermissionStatus()
+        }
+
         binding.btnProjection.setOnClickListener {
             requestProjection()
         }
@@ -93,7 +107,7 @@ class MainActivity : AppCompatActivity() {
             }
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R
                 && !ScreenshotManager.isReady
-                && !RootUtil.isRooted()
+                && com.gamemaster.agent.backend.BackendSelector.bestForShell() == null
             ) {
                 Toast.makeText(this, "Android 10 需要先点“开启屏幕录制授权”", Toast.LENGTH_LONG).show()
                 requestProjection()
@@ -189,13 +203,17 @@ class MainActivity : AppCompatActivity() {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
                 append("● 截屏能力：" + when {
                     ScreenshotManager.isReady -> "屏幕录制授权已开启"
-                    RootUtil.isRooted() -> "已通过 root 授权"
+                    com.gamemaster.agent.backend.BackendSelector.bestForShell() != null ->
+                        "已通过 ${com.gamemaster.agent.backend.BackendSelector.bestForShell()?.name} 授权"
                     else -> "未开启"
                 })
             }
         }
         // 按钮始终可点：缺少权限时点击会逐项弹提示引导开启
         binding.btnStart.isEnabled = true
+        // 后端状态：Root / Shizuku / 无障碍
+        binding.tvBackendStatus.text = "当前后端：${com.gamemaster.agent.backend.BackendSelector.currentName()}" +
+            if (com.gamemaster.agent.backend.BackendSelector.shizukuBound()) "（Shizuku 已授权）" else ""
     }
 
     private fun canDrawOverlays(): Boolean =
