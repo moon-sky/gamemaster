@@ -24,6 +24,12 @@
 - **Deterministic checks**: "Open an app" tasks are verified against the foreground package name as hard evidence, without relying on the vision model.
 - **Plan progress check**: `finish` is rejected until every planned step is completed.
 
+### 🧰 Python Tool System
+- **Chaquopy integration**: Python 3.9 runtime embedded in-app, no external Python required.
+- **Built-in tools**: `web_search` (Bing), `web_read` (URL fetcher), `apk_install` (download & pm install), `file_ops` (file operations).
+- **Tool-aware prompting**: The system prompt dynamically lists available tools with JSON call examples; the planner routes information-seeking tasks to `tool_call` instead of opening a browser.
+- **Auto step advancement**: After a successful tool call, `plan_step` auto-advances so weak models don't get stuck repeatedly calling the same tool.
+
 ### 🔧 System-Hosted Capabilities
 - **Search hosting**: Automatically identifies the search box, enters the keyword, and submits — working around self-drawn fake search boxes and clipboard restrictions.
 - **Download hosting**: For download tasks, it takes over the app-store flow — search, APK download detection, and `pm install`.
@@ -32,6 +38,11 @@
 ### 🎮 Game-Specific Optimizations
 - **Dead-swipe redirection**: In merge games like 2048, when the model's chosen swipe direction has no effect, the system automatically tries another direction.
 - **Restart detection**: Automatically recognizes and taps the "play again" button when a game ends.
+
+### 🔌 Backend Abstraction Layer
+- **Multi-backend support**: `RootBackend` (priority 10) > `ShizukuBackend` (8) > `AccessibilityBackend` (1) — automatically selects the best available backend.
+- **Shizuku support**: Execute shell commands via Shizuku without root, using reflection to access the private `binder` field.
+- **Unified API**: `BackendSelector.best()` returns the best backend; `bestForShell()` returns Root or Shizuku for shell commands.
 
 ---
 
@@ -47,7 +58,7 @@
 
 ### Requirements
 - Android 10 (API 29) or higher
-- Root access recommended (for screenshots; non-root devices can use the screen-recording grant instead)
+- Root access recommended (for screenshots and shell commands); non-root devices can use Shizuku or the screen-recording grant instead
 - Android Studio / JDK 11+ if building from source
 
 ### Option 1: Build from source
@@ -89,30 +100,40 @@ Download the APK from [Releases](../../releases) and install it directly.
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                  MainActivity               │  ← task input, model config, permissions
-└──────────────────┬──────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────┐
-│              GameAccessibilityService        │  ← UI tree reading, taps/swipes/input
-└──────────────────┬──────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────┐
-│                  GameAgent                   │  ← main loop: plan → observe → decide → act → verify
-│  ┌────────────┐ ┌──────────┐ ┌────────────┐ │
-│  │  makePlan  │ │ VisionAPI│ │  HealthCheck│ │  ← planning / vision decision / loop monitor
-│  └────────────┘ └──────────┘ └────────────┘ │
-│  ┌────────────┐ ┌──────────┐ ┌────────────┐ │
-│  │  SystemHost│ │ Evidence │ │  Recovery  │ │  ← system hosting / evidence gate / recovery
-│  └────────────┘ └──────────┘ └────────────┘ │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                      MainActivity                       │  ← task input, model config, permissions
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│                GameAccessibilityService                 │  ← UI tree reading, taps/swipes/input
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│                     GameAgent                            │  ← main loop: plan → observe → decide → act → verify
+│  ┌────────────┐ ┌──────────┐ ┌────────────┐             │
+│  │  makePlan  │ │ VisionAPI│ │  HealthCheck│             │  ← planning / vision decision / loop monitor
+│  └────────────┘ └──────────┘ └────────────┘             │
+│  ┌────────────┐ ┌──────────┐ ┌────────────┐             │
+│  │  SystemHost│ │ Evidence │ │  Recovery  │             │  ← system hosting / evidence gate / recovery
+│  └────────────┘ └──────────┘ └────────────┘             │
+│  ┌────────────┐                                          │
+│  │ ToolRegistry│                                         │  ← Python tool calls (web_search, web_read, ...)
+│  └────────────┘                                          │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│              BackendSelector (abstraction)               │  ← best() picks Root > Shizuku > Accessibility
+│  ┌───────────┐  ┌────────────┐  ┌────────────────────┐  │
+│  │ RootBackend│  │ShizukuBackend│  │AccessibilityBackend│  │  ← shell exec / screenshots / pm install
+│  └───────────┘  └────────────┘  └────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### Core loop
-1. **Plan** — the model decomposes the natural-language task into ordered steps.
+1. **Plan** — the model decomposes the natural-language task into ordered steps (tool-type vs app-type).
 2. **Observe** — screenshot plus accessibility tree describe the current screen.
-3. **Decide** — the model outputs the next action (tap / swipe / input / back / open app / finish).
-4. **Act** — the accessibility service executes it; system hosting takes over for search/download stages.
+3. **Decide** — the model outputs the next action (tap / swipe / input / back / open app / **tool_call** / finish).
+4. **Act** — the accessibility service executes screen actions; ToolRegistry routes `tool_call` to Python tools; BackendSelector picks the best backend for shell commands.
 5. **Verify** — check whether the task is complete; if stuck, trigger the recovery mechanism.
 
 ---
